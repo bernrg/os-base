@@ -55,6 +55,7 @@ As regras acima não dependem só de eu lembrar. `.claude/bin/guarda` roda antes
 
 - **Nega:** push forçado; `git clean` com `-x`; `git add -A`/`.`/`:/` e `commit -a` no repo da raiz; `rm -r` na raiz, em `brain/`, `brain/privado/`, `arquivo/`, na pasta pessoal, com curinga dentro de uma delas, num `.git` ou num projeto inteiro; commit que leva segredo.
 - **Pergunta a {{NOME}}:** `git push`, publicação, mesclar PR; `git reset --hard`, `git clean`, `git checkout .`, `git restore .`, apagar ramo à força, `git stash drop`.
+- O commit automático do fim de sessão (`auto-commit`) usa os mesmos padrões: arquivo que parece levar segredo fica retido, com o motivo em `.claude/abas/auto-commit.log`, e o resto segue.
 - `.claude/settings.json` nega ao Claude ler `.env` e arquivo de chave (`.pem`, `.key`), e editar `.env`. `.env.example` é livre.
 
 Guarda negou: ler o motivo, mudar o plano, **nunca** contornar (outro comando para o mesmo efeito, script que faz por dentro, variável que esconde o texto). Se a guarda errou, dizer isso a {{NOME}} e parar; quem decide afrouxar uma guarda é {{NOME}}, e a mudança vira commit com o porquê. A guarda é cinto de segurança, não barreira: o que ela não lê (comando em variável, `eval`, script) continua proibido pela regra escrita.

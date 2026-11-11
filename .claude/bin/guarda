@@ -22,7 +22,8 @@ PERGUNTA (o Claude Code para e pede a sua aprovação, com o que o comando faz):
     apagar ramo à força, `git stash drop`).
 
 Limites, ditos de propósito: é cinto de segurança, não barreira. Comando montado em
-variável, `eval`, `$(…)` ou script que chama git por dentro não é lido. O hook julga a
+variável, `eval`, `$(…)` ou script que chama git por dentro não é lido. (O `auto-commit`
+do OS é um desses scripts: por isso ele mesmo chama `segredos_dos_caminhos` antes de comitar.) O hook julga a
 chamada Bash INTEIRA antes de ela rodar: `git add x && git commit` é examinado pelo que
 está no disco naquele instante. Erro da própria guarda nunca derruba um comando (falha
 aberta): um hook que estoura bloquearia todo Bash da máquina.
@@ -43,9 +44,10 @@ import time
 RAIZ = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 # ---- o que sai da máquina e não volta: PERGUNTA ---------------------------------
+PUSH = ("git push", "O código sai desta máquina. Onde há publicação automática, o site muda sozinho.")
+# `git push` chamado por dentro de outro comando (`bash -c "git push"`, `xargs git push`).
+PUSH_INDIRETO = re.compile(r"\bgit\s+(?:-\S+\s+\S+\s+)*push\b")
 SAI_DA_MAQUINA = [
-    (r"\bgit\b[^|;&\n]*\bpush\b(?!.*--dry-run)", "git push",
-     "O código sai desta máquina. Onde há publicação automática, o site muda sozinho."),
     (r"\bvercel\b[^|;&\n]*--prod\b", "publicação em produção (Vercel)",
      "O site no ar passa a servir este código imediatamente."),
     (r"\bnetlify\s+deploy\b[^|;&\n]*--prod\b", "publicação em produção (Netlify)",
@@ -119,6 +121,10 @@ def trechos(cmd):
         elif c == "\\" and i + 1 < len(cmd):
             buf.extend((c, cmd[i + 1]))
             i += 2
+            continue
+        elif c == "#" and (i == 0 or cmd[i - 1] in " \t\n;|&("):
+            while i < len(cmd) and cmd[i] != "\n":      # comentário: o shell ignora até o fim da linha
+                i += 1
             continue
         elif c in ";|&\n()":
             saida.append("".join(buf))
@@ -314,6 +320,41 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None):
     return unicos
 
 
+def segredos_dos_caminhos(pasta, caminhos):
+    """{caminho: [o que parece]} entre os caminhos dados (relativos à raiz do repositório), pelo
+    que eles têm de diferente do último commit. Para quem comita SEM passar pelo hook: script
+    que chama o git por dentro não é visto pela guarda, então pergunta aqui antes de comitar."""
+    fim, retidos = time.monotonic() + PRAZO, {}
+    if not caminhos:
+        return retidos
+    for arq in caminhos:
+        if NOME_SEGREDO.search(arq) and not NOME_PERMITIDO.search(arq):
+            retidos.setdefault(arq, []).append("arquivo de segredo pelo nome")
+    arq = None
+    for linha in _git(pasta, "diff", "HEAD", "-U0", "--no-color", "--", *caminhos).splitlines():
+        if linha.startswith("+++ "):
+            arq = linha[6:] if linha.startswith("+++ b/") else linha[4:]
+        elif linha.startswith("+") and arq:
+            for rotulo in segredos_no_texto(linha[1:], so_fortes=bool(NOME_PERMITIDO.search(arq))):
+                if rotulo not in retidos.setdefault(arq, []):
+                    retidos[arq].append(rotulo)
+    topo = _topo(pasta)
+    for arq in _git(pasta, "ls-files", "--others", "--exclude-standard", "--full-name", "--", *caminhos).splitlines():
+        if time.monotonic() > fim:
+            retidos.setdefault(arq, []).append("não deu tempo de examinar")   # na dúvida, não vai
+            continue
+        try:
+            if os.path.getsize(os.path.join(topo, arq)) > TETO_ARQUIVO:
+                continue
+            with open(os.path.join(topo, arq), encoding="utf-8", errors="replace") as f:
+                for rotulo in segredos_no_texto(f.read(), so_fortes=bool(NOME_PERMITIDO.search(arq))):
+                    if rotulo not in retidos.setdefault(arq, []):
+                        retidos[arq].append(rotulo)
+        except OSError:
+            continue
+    return {a: r for a, r in retidos.items() if r}
+
+
 def protegidos(raiz, home):
     return {_real(raiz), _real(os.path.join(raiz, "brain")), _real(os.path.join(raiz, "brain", "privado")),
             _real(os.path.join(raiz, "arquivo")), _real(home), _real(os.path.join(home, "Documents")),
@@ -395,6 +436,11 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
                 return ("deny", "Push forçado reescreve o histórico no GitHub e apaga commit que só existe lá. "
                                 "Regra do OS: histórico publicado não se reescreve. Se for mesmo necessário, "
                                 "quem roda é você, no seu terminal.")
+            # Ensaio (`--dry-run`, `-n`) só dispensa a pergunta se for opção DESTE push, antes do `--`:
+            # a palavra solta em outro ponto da linha (`git push; echo --dry-run`) não conta.
+            opcoes = args[:args.index("--")] if "--" in args else args
+            if not ("--dry-run" in opcoes or "n" in _curtas(opcoes)):
+                perguntas.append(PUSH)
         elif sub == "clean":
             if {"x", "X"} & curtas:
                 return ("deny", "`git clean` com -x apaga o que está FORA do git. Na raiz isso inclui "
@@ -437,6 +483,9 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
                                 "Se for alarme falso (texto que só parece senha), diga isso a quem é dono do OS: "
                                 "quem decide é a pessoa, e o commit ela mesma faz no terminal.")
 
+    for _atual, p in comandos(cmd, cwd, home):
+        if os.path.basename(p[0]) != "git" and PUSH_INDIRETO.search(" ".join(p)):
+            perguntas.append(PUSH)
     for rx, rotulo, efeito in SAI_DA_MAQUINA:
         if re.search(rx, cmd):
             perguntas.append((rotulo, efeito))
@@ -573,6 +622,15 @@ def _selftest():
                     "npm publish", "gh repo create x --private", "gh workflow run deploy.yml"):
             ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
         ok("Como se desfaz?" in d("git push")[1], "a pergunta traz o plano de reversão")
+        # --dry-run só dispensa a pergunta se for opção DAQUELE push
+        for cmd in ("git push origin main; echo --dry-run", "git push && git status --dry-run",
+                    "git push origin main # --dry-run", "git push -- --dry-run", "git push; git push --dry-run",
+                    "bash -c 'git push origin main'", "xargs git push"):
+            ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
+        for cmd in ("git push -n", "git push --dry-run origin main", "git -C site push --dry-run",
+                    "git commit --only -m 'prepara o push de amanhã' -- STATUS.md", "git log --grep push",
+                    "git stash push -m x"):
+            ok(d(cmd) is None, "devia passar: %r → %r" % (cmd, d(cmd)))
 
         # -- push forçado: nega (todas as grafias)
         for cmd in ("git push --force", "git push -f origin main", "git push --force-with-lease",

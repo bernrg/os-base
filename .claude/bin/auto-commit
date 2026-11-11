@@ -8,6 +8,9 @@ no caminho, `memoria add`, subagentes inclusive), mais o `.claude/melhoria/ledge
 (append-only, do coletor). Lista vazia: não comita. O que ficou de fora vai para
 `.claude/abas/auto-commit.log` (fora do git), e o `doctor` acusa camada OS suja há dias.
 
+Arquivo que parece levar segredo (padrões da `guarda`) NUNCA entra neste commit: fica
+retido, com o motivo no log, e o resto segue. Sem conseguir examinar, nada é comitado.
+
 Nunca sai com código ≠ 0 nem passa de ~12 s: fim de sessão não bloqueia.
 
   auto-commit < payload.json  lê o JSON do SessionEnd no stdin (hook)
@@ -181,6 +184,25 @@ def commitar(raiz, caminhos):
     return False
 
 
+def reter_segredos(raiz, caminhos, guarda=None):
+    """(caminhos que podem ir, {caminho retido: motivos}). Este script chama o git por dentro,
+    então o hook da guarda não o vê: quem pergunta por segredo é ele mesmo, com os padrões
+    DELA (dono único: .claude/bin/guarda). Sem conseguir perguntar, nada é comitado: commit
+    automático pode esperar o /fim, segredo no histórico não se desfaz."""
+    if not caminhos:
+        return [], {}
+    guarda = guarda or os.path.join(os.path.dirname(os.path.abspath(__file__)), "guarda")
+    try:
+        carregador = importlib.machinery.SourceFileLoader("guarda_mod", guarda)
+        spec = importlib.util.spec_from_loader("guarda_mod", carregador)
+        mod = importlib.util.module_from_spec(spec)
+        carregador.exec_module(mod)
+        retidos = mod.segredos_dos_caminhos(raiz, list(caminhos))
+    except Exception:
+        return [], {c: ["a guarda não pôde examinar"] for c in caminhos}
+    return [c for c in caminhos if c not in retidos], retidos
+
+
 def plano(raiz, session_id, transcript_path, outras):
     candidatos = sujos(raiz)
     if not outras:
@@ -189,13 +211,16 @@ def plano(raiz, session_id, transcript_path, outras):
     return meus, [c for c in candidatos if c not in meus]
 
 
-def registrar(raiz, session_id, fora, falhou=None):
-    """Log fora do git: o que ficou de fora de propósito e o commit que falhou."""
-    if not fora and not falhou:
+def registrar(raiz, session_id, fora, falhou=None, segredo=None):
+    """Log fora do git: o que ficou de fora de propósito, o commit que falhou e o que foi
+    retido por parecer segredo (só o caminho e o tipo, nunca o valor)."""
+    if not fora and not falhou and not segredo:
         return
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "session_id": session_id, "fora": fora}
     if falhou:
         rec["falhou"] = falhou
+    if segredo:
+        rec["segredo"] = segredo
     try:
         os.makedirs(os.path.join(raiz, ".claude", "abas"), exist_ok=True)
         with open(os.path.join(raiz, LOG), "a", encoding="utf-8") as f:
@@ -218,8 +243,11 @@ def modo_hook(dry):
     sid = dados.get("session_id") or ""
     outras = outras_abas_vivas(sid)
     meus, fora = plano(raiz, sid, dados.get("transcript_path") or "", outras)
+    meus, retidos = reter_segredos(raiz, meus)
     if dry:
         print("outras abas vivas: %s" % ("sim" if outras else "não"))
+        for c, motivos in sorted(retidos.items()):
+            print("  retido (%s): %s" % ("; ".join(motivos), c))
         for c in meus:
             print("  comitaria: " + c)
         for c in fora:
@@ -228,7 +256,7 @@ def modo_hook(dry):
             print("  nada a comitar")
         return
     ok = commitar(raiz, meus)
-    registrar(raiz, sid, fora, falhou=None if ok or not meus else meus)
+    registrar(raiz, sid, fora, falhou=None if ok or not meus else meus, segredo=retidos)
 
 
 # ---- selftest -------------------------------------------------------------------
@@ -319,6 +347,26 @@ def modo_selftest():
         with open(os.path.join(raiz, LOG), encoding="utf-8") as f:
             rec = json.loads(f.readline())
         confere("o que ficou de fora vai para o log", (rec["fora"], rec["falhou"]), (["STATUS.md"], ["x.md"]))
+
+        # segredo não entra em commit automático: o arquivo fica retido, o resto segue
+        chave = "sk-" + "ant-" + "a1B2" * 8                        # montada por pedaços, de propósito
+        with open(os.path.join(raiz, "brain/notas/novo-com-chave.md"), "w") as f:
+            f.write("a chave é " + chave + "\n")
+        with open(os.path.join(raiz, "brain/notas/c.md"), "a") as f:   # rastreado, já sujo
+            f.write("sen" + 'ha = "Xk29fjq0Lm3p"\n')
+        with open(os.path.join(raiz, "brain/notas/limpo.md"), "w") as f:
+            f.write("nota comum, fala de senha e de token sem trazer nenhum\n")
+        cand = ["brain/notas/novo-com-chave.md", "brain/notas/c.md", "brain/notas/limpo.md"]
+        limpos, retidos = reter_segredos(raiz, cand)
+        confere("segredo: só o limpo segue", limpos, ["brain/notas/limpo.md"])
+        confere("segredo: retidos com o motivo", sorted(retidos), ["brain/notas/c.md", "brain/notas/novo-com-chave.md"])
+        confere("segredo: o log nunca repete o valor", chave in json.dumps(retidos), False)
+        confere("segredo: sem a guarda nada é comitado (falha fechada)",
+                reter_segredos(raiz, cand, guarda=os.path.join(tmp, "nao-existe"))[0], [])
+        registrar(raiz, "s", [], segredo=retidos)
+        with open(os.path.join(raiz, LOG), encoding="utf-8") as f:
+            ultimo = json.loads(f.readlines()[-1])
+        confere("segredo: vai para o log", sorted(ultimo["segredo"]), sorted(retidos))
 
         # caminho que já não difere do HEAD não derruba o commit do resto
         with open(os.path.join(raiz, "brain/notas/ad.md"), "w") as f:
