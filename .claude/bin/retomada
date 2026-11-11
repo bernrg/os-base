@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""retomada — hook PreCompact: diz ao resumo de compactação o que não pode se perder.
+
+Contrato (doc oficial, lida em 2026-11-10: https://code.claude.com/docs/en/hooks,
+seção PreCompact): com exit 0, o stdout deste hook vira instrução do resumo; exit 2
+BLOQUEIA a compactação (e, se ela veio para recuperar de limite de contexto, o pedido
+falha). Por isso este script NUNCA sai com != 0 e, com entrada ilegível, ainda imprime
+a instrução base. Teto de 10.000 caracteres por hook.
+
+`retomada --selftest` roda os testes embutidos.
+"""
+import json
+import subprocess
+import sys
+
+
+BASE = """\
+Este resumo é o único contexto da sessão depois da compactação. Além do resumo normal, preserve, sem parafrasear o que for citação:
+
+1. Pedidos do dono do OS nesta sessão, verbatim e em ordem; o último, por inteiro.
+2. Autorizações e proibições que ele deu, com o escopo exato: push, deploy e escrita em produção valem só para o repo e o commit citados. "Pode seguir" não autoriza push. Não ampliar nenhuma autorização.
+3. Onde cada mudança mora: repo (subpasta da raiz), ramo, worktree e hash de cada commit; o que está sem commit; o que foi para o ar (onde, com que hash) e o que não foi.
+4. Evidência já mostrada: comando de aceite e resultado, com os números. E o que NÃO foi verificado.
+5. Trabalho em andamento: tarefa corrente, próximo passo, e cada subagente ou processo em segundo plano (nome ou id), inclusive os que tinham autorização de escrita.
+6. O que ainda falta para o /fim: histórico a escrever na nota do projeto, linha do STATUS.md a atualizar, memória nova a registrar.
+7. Fatos descobertos junto com a fonte (URL oficial, "lido em AAAA-MM-DD"); fato sem fonte segue marcado [a confirmar].
+8. Caminhos já descartados e por quê, para não repetir.
+9. Outras abas vivas citadas e o que é delas (não tocar)."""
+
+
+def main():
+    # A doc não diz se o stdout soma ou substitui o que o dono passou ao /compact:
+    # repetir aqui garante que a instrução dele não se perde (no pior caso, duplica).
+    try:
+        pedido = json.load(sys.stdin).get("custom_instructions")
+    except (ValueError, AttributeError, OSError):
+        pedido = None  # entrada ilegível: segue só com a base, nunca cala nem bloqueia
+    if isinstance(pedido, str) and pedido.strip():
+        print("Instrução do dono para esta compactação (prioridade):\n%s\n" % pedido)
+    print(BASE)
+
+
+def _rodar(entrada):
+    return subprocess.run([sys.executable, __file__], input=entrada,
+                          capture_output=True, text=True, timeout=10)
+
+
+def _selftest():
+    auto = json.dumps({"hook_event_name": "PreCompact", "trigger": "auto",
+                       "custom_instructions": None})
+    r = _rodar(auto)
+    assert r.returncode == 0, "auto: saiu com %d" % r.returncode
+    for marca in ("verbatim", "push", "ramo", "evidência", "subagente"):
+        assert marca in r.stdout.lower(), "auto: instrução base sem '%s'" % marca
+    assert len(r.stdout) < 10000, "auto: %d caracteres, teto é 10.000" % len(r.stdout)
+
+    manual = json.dumps({"hook_event_name": "PreCompact", "trigger": "manual",
+                         "custom_instructions": "foque no deploy do site"})
+    r = _rodar(manual)
+    assert r.returncode == 0, "manual: saiu com %d" % r.returncode
+    assert "foque no deploy do site" in r.stdout, "manual: instrução do /compact sumiu"
+    assert "verbatim" in r.stdout, "manual: instrução base sumiu"
+
+    for nome, lixo in (("vazio", ""), ("não-JSON", "{isto não é json"), ("lista", "[1, 2]")):
+        r = _rodar(lixo)
+        assert r.returncode == 0, "%s: saiu com %d (2 bloquearia a compactação)" % (nome, r.returncode)
+        assert "verbatim" in r.stdout, "%s: entrada ilegível calou a instrução base" % nome
+
+    print("retomada selftest ok")
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        main()

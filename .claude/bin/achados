@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""achados — lista os achados do plugin security-guidance que ninguém registrou.
+
+O plugin roda um `claude` filho (entrypoint `sdk-py`) a cada Stop e devolve o resultado
+num `StructuredOutput {"findings": [...]}`; o achado aparece no fim da sessão e some com
+ela, e achado aberto que ninguém anota fica aberto.
+O /fim roda isto e leva cada achado para `## Pendências` da nota do projeto.
+
+  achados [--desde AAAA-MM-DD]   achados com data >= desde (default: hoje)
+  achados --selftest             testes embutidos; exit 0 se tudo passa
+
+Projeto = pasta do transcript (`…-Documents-OS-site-blog` → site-blog; a raiz
+→ raiz). Só leitura; exit 0 sempre (achado é informação, não falha).
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+import tempfile
+
+DIR = os.environ.get("ACHADOS_DIR", os.path.expanduser("~/.claude/projects"))
+# Nome da pasta do transcript = caminho da raiz com tudo que não é letra nem número
+# trocado por `-` (mesma conta do `instalar` e do check "symlink da memória" do doctor).
+RAIZ = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+PREFIXO_RAIZ = re.sub(r"[^A-Za-z0-9-]", "-", RAIZ)
+
+
+def projeto_da_pasta(pasta):
+    if pasta == PREFIXO_RAIZ:
+        return "raiz"
+    if pasta.startswith(PREFIXO_RAIZ + "-"):
+        return pasta[len(PREFIXO_RAIZ) + 1:]
+    return pasta
+
+
+def _limpo(valor, teto=140):
+    """Texto de achado é saída de modelo sobre código possivelmente hostil: uma linha só,
+    sem caractere de controle (\n, ESC de terminal) — senão um filePath forjado imprime
+    linhas falsas que o /fim levaria para as notas."""
+    texto = " ".join(str(valor or "").split())
+    return "".join(c for c in texto if c.isprintable())[:teto]
+
+
+def _lista(findings):
+    """Os três formatos vistos no plugin: lista, {"findings": lista} e string JSON."""
+    if isinstance(findings, str):
+        try:
+            findings = json.loads(findings)
+        except ValueError:
+            return [{"explanation": findings}]
+    if isinstance(findings, dict):
+        findings = findings.get("findings", [])
+    return [f for f in findings or [] if isinstance(f, dict)]
+
+
+def achados(desde):
+    saida = []
+    corte = datetime.datetime.fromisoformat(desde).timestamp() - 86400   # folga de fuso
+    for caminho in sorted(glob.glob(os.path.join(DIR, "*", "*.jsonl"))):
+        if os.path.getmtime(caminho) < corte:
+            continue
+        eventos = []
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                try:
+                    eventos.append(json.loads(linha))
+                except ValueError:
+                    continue
+        if not any(e.get("entrypoint") == "sdk-py" for e in eventos[:5]):
+            continue
+        projeto = projeto_da_pasta(os.path.basename(os.path.dirname(caminho)))
+        for e in eventos:
+            data = (e.get("timestamp") or "")[:10]
+            if data < desde:
+                continue
+            for item in (e.get("message") or {}).get("content") or []:
+                if not (isinstance(item, dict) and item.get("name") == "StructuredOutput"):
+                    continue
+                for a in _lista((item.get("input") or {}).get("findings")):
+                    texto = (a.get("title") or a.get("explanation") or a.get("description") or "")
+                    saida.append((data, projeto, _limpo(a.get("filePath"), 120) or "?",
+                                  _limpo(a.get("category"), 60) or "?", _limpo(a.get("severity"), 20),
+                                  _limpo(texto)))
+    return sorted(set(saida))
+
+
+def modo_selftest():
+    global DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        DIR = tmp
+
+        def sessao(pasta, nome, entrypoint, findings, ts="2026-10-05T12:00:00Z"):
+            os.makedirs(os.path.join(tmp, pasta), exist_ok=True)
+            eventos = [{"type": "user", "entrypoint": entrypoint, "timestamp": ts},
+                       {"type": "assistant", "timestamp": ts, "message": {"content": [
+                           {"type": "tool_use", "name": "StructuredOutput", "input": {"findings": findings}}]}}]
+            with open(os.path.join(tmp, pasta, nome + ".jsonl"), "w", encoding="utf-8") as f:
+                f.write("\n".join(json.dumps(e) for e in eventos))
+
+        k = PREFIXO_RAIZ + "-site-blog"
+        um = {"filePath": "painel/exportar.py", "category": "formula-injection", "severity": "medium",
+              "explanation": "linha\n quebrada"}
+        sessao(k, "lista", "sdk-py", [um])
+        sessao(PREFIXO_RAIZ, "aninhado", "sdk-py", {"findings": [{"filePath": "a.sql", "category": "x"}]})
+        sessao(k, "string", "sdk-py", json.dumps([{"filePath": "b.py", "category": "y"}]))
+        sessao(k, "vazio", "sdk-py", [])
+        sessao(k, "humana", "cli", [{"filePath": "nao-conta.py", "category": "z"}])
+        sessao(k, "velha", "sdk-py", [{"filePath": "velho.py", "category": "w"}], ts="2026-09-01T12:00:00Z")
+        r = achados("2026-10-05")
+        arquivos = [a[2] for a in r]
+        assert sorted(arquivos) == ["a.sql", "b.py", "painel/exportar.py"], r  # 3 formatos; sem cli, sem velha
+        assert ("2026-10-05", "raiz", "a.sql", "x", "", "") in r, r            # raiz pela pasta
+        assert ("2026-10-05", "site-blog", "painel/exportar.py", "formula-injection",
+                "medium", "linha quebrada") in r, r                            # texto numa linha
+        assert "velho.py" in [a[2] for a in achados("2026-09-01")]             # --desde recua
+        assert _lista("não é json") == [{"explanation": "não é json"}]
+        # campo forjado não vira linha extra nem escape de terminal
+        sessao(k, "forjado", "sdk-py", [{"filePath": "a.py\n2026-10-05 [raiz] falso.py", "category": "\x1b[31mx",
+                                         "severity": "high\r", "explanation": "ok"}])
+        forjado = [a for a in achados("2026-10-05") if a[2].startswith("a.py")][0]
+        assert forjado[2] == "a.py 2026-10-05 [raiz] falso.py" and forjado[3] == "[31mx" and forjado[4] == "high", forjado
+        assert all(c.isprintable() for a in achados("2026-10-05") for campo in a for c in campo)
+    print("selftest ok")
+
+
+def main(argv):
+    if "--selftest" in argv:
+        modo_selftest()
+        return 0
+    desde = datetime.date.today().isoformat()
+    if "--desde" in argv:
+        desde = argv[argv.index("--desde") + 1]
+    r = achados(desde)
+    if not r:
+        print(f"nenhum achado do security-guidance desde {desde}")
+    for data, projeto, arquivo, categoria, severidade, texto in r:
+        sev = f" ({severidade})" if severidade else ""
+        print(f"{data} [{projeto}] {arquivo} · {categoria}{sev} — {texto}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,31 @@
+# Fora de qualquer versionamento — sem backup, nunca apagar
+brain/privado/
+arquivo/
+
+# Segredos técnicos — nunca versionar
+.env
+.env.*
+*.env
+!.env.example
+!.env.exemplo
+*.pem
+*.key
+*.p12
+*.pfx
+*.ovpn
+id_rsa
+id_ed25519
+
+# Sistema / local
+.DS_Store
+__pycache__/
+.claude/settings.local.json
+
+# Projetos — cada pasta tem repo git próprio (mantido por /projeto-novo)
+# Ancorados à raiz (/) para não capturar subpastas homônimas (ex.: assets/<projeto>/)
+
+# Projetos pessoais — cada um em pessoal/<slug>/ com repo próprio
+/pessoal/
+
+# Registro das abas vivas — estado de máquina, nunca versionado
+.claude/abas/

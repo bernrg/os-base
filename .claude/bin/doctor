@@ -1,0 +1,576 @@
+#!/bin/bash
+# doctor — auditoria da camada OS. Uma linha PASS/WARN/FAIL por check; exit 0 só sem FAIL.
+# Roda de qualquer cwd: a raiz é derivada do caminho deste script (.claude/bin/doctor).
+set -u
+SELF="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SELF/../.." && pwd)"
+exec python3 - "$ROOT" <<'PY'
+import datetime
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter
+
+ROOT = sys.argv[1]
+sys.path.insert(0, os.path.join(ROOT, ".claude", "bin"))
+import oslib
+HOME = os.path.expanduser("~")
+
+# Orçamento do núcleo sempre-ligado (check 1): o que o Claude lê em TODA sessão.
+# Dono único dos dois números: mudar só aqui, que as mensagens acompanham. O alerta
+# fica a 8/9 do teto. Núcleo grande demais custa contexto em toda conversa.
+NUCLEO_TETO = 50000
+NUCLEO_WARN = NUCLEO_TETO * 8 // 9
+# Índice de memórias (check 7). O teto real é do Claude Code, que só carrega as
+# primeiras 200 linhas ou 25 KB do MEMORY.md (code.claude.com/docs/en/memory) e
+# descarta o resto em silêncio. Os dois tetos daqui alertam com folga antes do corte.
+INDICE_TETO = 20000
+INDICE_LINHAS = 180
+# Fatia do núcleo reservada ao painel (check 2).
+PAINEL_TETO = 16666
+
+def j(*p):
+    return os.path.join(ROOT, *p)
+
+def read(p):
+    with open(p, encoding="utf-8") as f:
+        return f.read()
+
+def git(*args, entrada=None):
+    return subprocess.run(["git", "-C", ROOT, *args], capture_output=True, text=True, input=entrada)
+
+results = []
+pass_ = lambda m: results.append(("PASS", m))
+warn = lambda m: results.append(("WARN", m))
+fail = lambda m: results.append(("FAIL", m))
+
+# ---- 1. Núcleo sempre-ligado -------------------------------------------------
+CORE = ["CLAUDE.md", "brain/SOUL.md", "brain/CONTEXTO.md", "STATUS.md", "brain/memoria/MEMORY.md"]
+JANELA = 7  # dias da janela de tendência
+
+def nucleo_ha(dias):
+    """Soma do núcleo no último commit anterior a `dias` atrás. None se não der
+    para medir (fora de repo, repo raso, sem commit tão antigo, arquivo que ainda
+    não existia). Dois processos: um rev-list e um cat-file em lote."""
+    r = git("rev-list", "-1", f"--before={dias} days ago", "HEAD")
+    commit = r.stdout.strip()
+    if r.returncode != 0 or not commit:
+        return None
+    pedido = "".join(f"{commit}:{f}\n" for f in CORE)
+    b = git("cat-file", "--batch-check=%(objectsize)", entrada=pedido)
+    if b.returncode != 0:
+        return None
+    linhas = b.stdout.split()
+    # objeto ausente naquele commit vira "missing"; sem os quatro não há base honesta
+    if len(linhas) != len(CORE) or not all(x.isdigit() for x in linhas):
+        return None
+    return sum(int(x) for x in linhas)
+
+def tendencia(total):
+    """Sufixo informativo da linha do núcleo. NUNCA muda o veredito."""
+    antes = nucleo_ha(JANELA)
+    if antes is None:
+        return f" · tendência: sem referência de {JANELA}d"
+    taxa = (total - antes) / JANELA
+    if taxa <= 0:
+        return f" · {taxa:+.0f} B/dia em {JANELA}d"
+    faltam = (NUCLEO_TETO - total) / taxa
+    if faltam <= 0:
+        return f" · {taxa:+.0f} B/dia em {JANELA}d · teto já estourado"
+    if faltam > 365:
+        return f" · {taxa:+.0f} B/dia em {JANELA}d · teto a mais de 1 ano"
+    quando = datetime.date.today() + datetime.timedelta(days=round(faltam))
+    return f" · {taxa:+.0f} B/dia em {JANELA}d · teto em ~{quando} ({round(faltam)}d)"
+
+ausentes = [f for f in CORE if not os.path.isfile(j(f))]
+if ausentes:
+    fail("núcleo: arquivo ausente: " + ", ".join(ausentes))
+else:
+    total = sum(os.path.getsize(j(f)) for f in CORE)
+    tend = tendencia(total)
+    if total > NUCLEO_TETO:
+        fail(f"núcleo sempre-ligado: {total} bytes (acima do teto de {NUCLEO_TETO}){tend}")
+    elif total > NUCLEO_WARN:
+        warn(f"núcleo sempre-ligado: {total} bytes (alerta {NUCLEO_WARN}, teto {NUCLEO_TETO}){tend}")
+    else:
+        pass_(f"núcleo sempre-ligado: {total} bytes (teto {NUCLEO_TETO}){tend}")
+
+status_txt = read(j("STATUS.md")) if os.path.isfile(j("STATUS.md")) else ""
+# Linha que veio pronta do modelo não envelhece antes de o OS ser de alguém: a idade de
+# fila e de elo (checks 8 e 10) conta, no mínimo, a partir do commit `instalação: …`.
+_marco = git("log", "-1", "--format=%ct", "--grep=^instalação:").stdout.strip()
+MARCO_INSTALACAO = int(_marco) if _marco.isdigit() else 0
+
+# ---- 2. Painel ---------------------------------------------------------------
+notas_dir = j("brain", "notas", "projetos")
+notas = sorted(f for f in os.listdir(notas_dir) if f.endswith(".md")) if os.path.isdir(notas_dir) else []
+problemas = []
+if len(status_txt) > PAINEL_TETO:
+    problemas.append(f"STATUS.md com {len(status_txt)} chars (máx. {PAINEL_TETO})")
+linhas_tab = [l for l in status_txt.splitlines() if l.strip().startswith("|")]
+dados = [l for l in linhas_tab if not re.match(r"^\|[\s:|-]+\|$", l.strip())]
+for l in dados:
+    celulas = [c.strip() for c in l.strip().strip("|").split("|")]
+    if len(celulas) != 4:
+        problemas.append(f"linha com {len(celulas)} colunas (esperado 4 — `|` dentro de célula?): {l[:60]}")
+    for c in celulas:
+        if len(c) > 200:
+            problemas.append(f"célula com {len(c)} chars (máx. 200): {c[:50]}…")
+# Linhas cujo detalhe vive fora do git (vida pessoal): contam no
+# painel, mas não exigem nota em brain/notas/projetos/ nem pasta no .gitignore.
+FORA_DO_VAULT = ("brain/privado/",)
+dados = [l for l in dados if not any(p in l for p in FORA_DO_VAULT)]
+n_linhas = max(0, len(dados) - 1)  # menos o cabeçalho
+if problemas:
+    fail("painel: " + "; ".join(problemas))
+elif n_linhas != len(notas):
+    warn(f"painel: {n_linhas} linha(s) na tabela vs {len(notas)} nota(s) em brain/notas/projetos/")
+else:
+    pass_(f"painel: tabela bem-formada, {n_linhas} projeto(s) = {len(notas)} nota(s)")
+
+# ---- 3. Fila -----------------------------------------------------------------
+fila_bullets = []  # (slug, texto, nº da linha no arquivo, 1-based)
+# O título leva o nome de quem é dono do OS ("## Fila de <nome>"): casa pelo prefixo.
+m = re.search(r"^## Fila\b[^\n]*\n(.*?)(?=^## |\Z)", status_txt, re.M | re.S)
+if not m:
+    fail("fila: seção '## Fila de <nome>' não encontrada no STATUS.md")
+else:
+    ini = status_txt[:m.start(1)].count("\n")
+    errs = []
+    seq = []
+    for i, l in enumerate(m.group(1).splitlines()):
+        if not l.strip():
+            continue
+        mb = re.match(r"^- \[([^\]\s]+)\] (.+)$", l)
+        if not mb:
+            errs.append(f"linha fora do formato '- [projeto] ação': {l[:60]!r}")
+            continue
+        fila_bullets.append((mb.group(1), mb.group(2), ini + i + 1))
+        seq.append(mb.group(1))
+    for slug, n in Counter(seq).items():
+        if n > 3:
+            errs.append(f"projeto [{slug}] com {n} itens na fila (máx. 3)")
+    vistos, atual = set(), None
+    for s in seq:
+        if s != atual:
+            if s in vistos:
+                errs.append(f"bloco de [{s}] não contíguo na fila")
+            vistos.add(s)
+            atual = s
+    if errs:
+        fail("fila: " + "; ".join(errs))
+    else:
+        pass_(f"fila: {len(fila_bullets)} item(ns) bem-formados, blocos contíguos, máx. 3/projeto")
+
+# ---- 4. Pendências (marcador (+N na nota)) -----------------------------------
+def conta_pendencias(slug):
+    p = os.path.join(notas_dir, slug + ".md")
+    if not os.path.isfile(p):
+        return None
+    mm = re.search(r"^## Pendências\n(.*?)(?=^## |\Z)", read(p), re.M | re.S)
+    if not mm:
+        return None
+    return len([l for l in mm.group(1).splitlines() if l.strip().startswith("- ")])
+
+derivas = []
+por_slug = {}
+for slug, texto, _ln in fila_bullets:
+    por_slug.setdefault(slug, []).append(texto)
+for slug, textos in por_slug.items():
+    marcas = [re.search(r"\(\+(\d+) na nota\)", t) for t in textos]
+    marcas = [int(mm.group(1)) for mm in marcas if mm]
+    n_nota = conta_pendencias(slug)
+    if marcas:
+        if n_nota is None:
+            derivas.append(f"[{slug}] marca (+{marcas[-1]} na nota) mas a nota/seção Pendências não existe")
+        elif n_nota != marcas[-1]:
+            derivas.append(f"[{slug}] marca (+{marcas[-1]} na nota) mas a nota tem {n_nota} pendência(s)")
+    elif n_nota:
+        derivas.append(f"[{slug}] tem {n_nota} pendência(s) na nota sem marcador (+N na nota) na fila")
+if derivas:
+    warn("pendências: " + "; ".join(derivas))
+else:
+    pass_("pendências: marcadores (+N na nota) em dia com as notas")
+
+# ---- 5. Symlink da memória ---------------------------------------------------
+slug_os = re.sub(r"[^A-Za-z0-9-]", "-", ROOT)   # mesma conta do `instalar` (dono: instalar.slug_projeto)
+link = os.path.join(HOME, ".claude", "projects", slug_os, "memory")
+alvo = j("brain", "memoria")
+if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(alvo):
+    pass_("symlink da memória: ~/.claude/projects/" + slug_os + "/memory → brain/memoria/")
+else:
+    fail(f"symlink da memória: {link} ausente ou não aponta para {alvo} — rodar .claude/bin/instalar")
+
+# ---- 6. Gitignore ------------------------------------------------------------
+slugs_proj = [os.path.splitext(f)[0] for f in notas]
+# Projeto pessoal mora em pessoal/<slug>/; os demais, na raiz.
+pasta_proj = lambda s: f"pessoal/{s}" if os.path.isdir(j("pessoal", s)) else s
+testar = ["brain/privado/x", "arquivo/x", "pessoal/x"] + [f"{pasta_proj(s)}/x" for s in slugs_proj]
+nao_ign = [p for p in testar if git("check-ignore", "-q", p).returncode != 0]
+if nao_ign:
+    fail("gitignore: NÃO ignorados: " + ", ".join(nao_ign))
+else:
+    pass_(f"gitignore: privado/, arquivo/, pessoal/ e {len(slugs_proj)} pasta(s) de projeto ignorados")
+
+# ---- 7. Índice de memórias ---------------------------------------------------
+mem_dir = j("brain", "memoria")
+mem_files = sorted(f for f in os.listdir(mem_dir) if f.endswith(".md") and f != "MEMORY.md") if os.path.isdir(mem_dir) else []
+idx_path = os.path.join(mem_dir, "MEMORY.md")
+idx = read(idx_path) if os.path.isfile(idx_path) else ""
+sem_linha, quebrados = oslib.indice_memorias(ROOT)
+
+def corpo_memoria(fn):
+    """Texto depois do frontmatter. Memória só com frontmatter é fato sem conteúdo."""
+    t = read(os.path.join(mem_dir, fn))
+    mfm = re.match(r"^---\n.*?\n---\n?", t, re.S)
+    return t[mfm.end():] if mfm else t
+
+vazias = [f for f in mem_files if not corpo_memoria(f).strip()]
+if sem_linha or quebrados or vazias:
+    partes = []
+    if sem_linha:
+        partes.append("memória sem linha no MEMORY.md: " + ", ".join(sem_linha))
+    if quebrados:
+        partes.append("linha do MEMORY.md sem arquivo: " + ", ".join(quebrados))
+    if vazias:
+        partes.append("memória sem corpo (só frontmatter — escrever o fato ou apagar): " + ", ".join(vazias))
+    fail("índice de memórias: " + "; ".join(partes))
+elif len(idx.encode()) > INDICE_TETO or idx.count("\n") > INDICE_LINHAS:
+    warn(f"índice de memórias: biunívoco, mas MEMORY.md com {len(idx.encode())} bytes e {idx.count(chr(10))} linhas "
+         f"(teto {INDICE_TETO} bytes / {INDICE_LINHAS} linhas; o Claude Code corta em 25 KB / 200) — apertar gancho antes de fundir memória")
+else:
+    pass_(f"índice de memórias: biunívoco ({len(mem_files)} memória(s))")
+
+# ---- 8. Staleness ------------------------------------------------------------
+hoje = datetime.date.today()
+stale = []
+mu = re.search(r"_Última atualização: (\d{4}-\d{2}-\d{2})_", status_txt)
+if not mu:
+    stale.append("STATUS.md sem linha '_Última atualização: AAAA-MM-DD_'")
+else:
+    d = datetime.date.fromisoformat(mu.group(1))
+    if (hoje - d).days > 3:
+        stale.append(f"STATUS.md atualizado pela última vez em {d} ({(hoje - d).days} dias)")
+if fila_bullets:
+    bl = git("blame", "--line-porcelain", "STATUS.md")
+    if bl.returncode == 0:
+        tempos, ln = {}, None
+        for l in bl.stdout.splitlines():
+            mh = re.match(r"^[0-9a-f]{40} \d+ (\d+)", l)
+            if mh:
+                ln = int(mh.group(1))
+            elif l.startswith("committer-time ") and ln is not None:
+                tempos[ln] = int(l.split()[1])
+        velhos = sum(
+            1 for _s, _t, n in fila_bullets
+            if tempos.get(n) and (hoje - datetime.date.fromtimestamp(max(tempos[n], MARCO_INSTALACAO))).days > 7
+        )
+        if velhos:
+            stale.append(f"{velhos} item(ns) da fila parados há >7 dias")
+alvos45 = [os.path.join(mem_dir, f) for f in mem_files]
+packs_dir = os.path.join(notas_dir, "packs")
+if os.path.isdir(packs_dir):
+    alvos45 += [os.path.join(packs_dir, f) for f in sorted(os.listdir(packs_dir)) if f.endswith(".md")]
+frios = []
+for p in alvos45:
+    r = git("log", "-1", "--format=%ct", "--", os.path.relpath(p, ROOT))
+    ts = r.stdout.strip()
+    t = int(ts) if ts else int(os.path.getmtime(p))
+    if (hoje - datetime.date.fromtimestamp(t)).days > 45:
+        frios.append(os.path.basename(p))
+if frios:
+    stale.append("sem toque há >45 dias: " + ", ".join(frios))
+nomes_mem = {os.path.splitext(f)[0] for f in mem_files}
+quebrados_wl = set()
+# Code span (`…`) e fence (```…```) não são wikilink para o Obsidian: um `[[ -o interactive ]]`
+# numa memória acusaria "memória inexistente: -o interactive".
+SEM_CODE = (re.compile(r"```.*?```", re.S), re.compile(r"`[^`\n]*`"))
+
+def sem_code(txt):
+    for rx in SEM_CODE:
+        txt = rx.sub("", txt)
+    return txt
+
+for f in mem_files:
+    for wl in re.findall(r"\[\[([^\]|#]+)", sem_code(read(os.path.join(mem_dir, f)))):
+        if wl.strip() not in nomes_mem:
+            quebrados_wl.add(wl.strip())
+if quebrados_wl:
+    stale.append("wikilink para memória inexistente: " + ", ".join(sorted(quebrados_wl)))
+if stale:
+    warn("staleness: " + "; ".join(stale))
+else:
+    pass_("staleness: painel, fila, memórias e wikilinks em dia")
+
+# ---- 9. Frontmatter e vocabulário fechado (dono único: brain/REGRAS.md) ------
+notas_root = j("brain", "notas")
+regras_path = j("brain", "REGRAS.md")
+TIPOS = {"projeto", "conhecimento", "diario", "semana", "melhoria", "pack", "cruzamento"}
+STATUS_VALIDOS = {"semente", "ativa", "madura", "dormente"}
+
+def vocab(bloco, txt):
+    m = re.search(rf"<!-- VOCAB:{bloco} -->\n(.*?)\n<!-- /VOCAB:{bloco} -->", txt, re.S)
+    return set(m.group(1).split()) if m else None
+
+def campo_lista(fm, campo):
+    m = re.search(rf"^{campo}:\s*(.+)$", fm, re.M)
+    if not m:
+        return None
+    v = m.group(1).strip()
+    v = v[1:-1] if v.startswith("[") and v.endswith("]") else v
+    return [x.strip().strip("'\"") for x in v.split(",") if x.strip()]
+
+def campo_esc(fm, campo):
+    m = re.search(rf"^{campo}:\s*(.+)$", fm, re.M)
+    return m.group(1).strip().strip("'\"") if m else None
+
+if not os.path.isfile(regras_path):
+    warn("frontmatter: brain/REGRAS.md ausente — sem fonte do vocabulário fechado")
+else:
+    regras = read(regras_path)
+    voc_dom, voc_forma = vocab("dominio", regras), vocab("forma", regras)
+    if voc_dom is None or voc_forma is None:
+        warn("frontmatter: bloco <!-- VOCAB:dominio/forma --> ausente em brain/REGRAS.md")
+    else:
+        problemas9, n_notas = [], 0
+        for base, dirs, files in os.walk(notas_root):
+            dirs[:] = [d for d in dirs if d not in ("privado", "arquivo")]
+            for fn in sorted(files):
+                if not fn.endswith(".md"):
+                    continue
+                rel = os.path.relpath(os.path.join(base, fn), ROOT)
+                mfm = re.match(r"^---\n(.*?)\n---", read(os.path.join(base, fn)), re.S)
+                if not mfm:
+                    problemas9.append(f"{rel}: sem frontmatter")
+                    continue
+                n_notas += 1
+                fm = mfm.group(1)
+                tipo, criado, status = (campo_esc(fm, c) for c in ("tipo", "criado", "status"))
+                doms, formas = campo_lista(fm, "dominio"), campo_lista(fm, "forma")
+                faltando = [c for c, v in (("tipo", tipo), ("dominio", doms), ("forma", formas),
+                                           ("criado", criado), ("status", status)) if v is None]
+                if faltando:
+                    problemas9.append(f"{rel}: campo(s) ausente(s): {', '.join(faltando)}")
+                    continue
+                if tipo not in TIPOS:
+                    problemas9.append(f"{rel}: tipo '{tipo}' fora do vocabulário")
+                if status not in STATUS_VALIDOS:
+                    problemas9.append(f"{rel}: status '{status}' fora do vocabulário")
+                if not re.match(r"^\d{4}-\d{2}-\d{2}$", criado):
+                    problemas9.append(f"{rel}: criado '{criado}' não é AAAA-MM-DD")
+                fora_d = [d for d in doms if d not in voc_dom]
+                fora_f = [f for f in formas if f not in voc_forma]
+                if fora_d:
+                    problemas9.append(f"{rel}: dominio fora do vocabulário: {', '.join(fora_d)}")
+                if fora_f:
+                    problemas9.append(f"{rel}: forma fora do vocabulário: {', '.join(fora_f)}")
+        if problemas9:
+            warn("frontmatter: " + "; ".join(problemas9))
+        else:
+            pass_(f"frontmatter: {n_notas} nota(s) com schema (5 campos) e vocabulário válidos")
+
+# ---- 10. Cruzamentos-semente e elos especulativos parados --------------------
+# Ambos "nem promovidos, nem descartados": um cruzamento preso em status: semente
+# e um bullet #elo-especulativo que nunca virou [[wikilink]] na prosa nem sumiu.
+TETO_ELO = 30
+parados = []
+# (a) elos #elo-especulativo velhos (idade por blame de linha, como o check 8)
+for base, dirs, files in os.walk(notas_root):
+    dirs[:] = [d for d in dirs if d not in ("privado", "arquivo")]
+    for fn in sorted(files):
+        if not fn.endswith(".md"):
+            continue
+        rel = os.path.relpath(os.path.join(base, fn), ROOT)
+        linhas = read(os.path.join(base, fn)).splitlines()
+        alvo = [i + 1 for i, l in enumerate(linhas)
+                if "#elo-especulativo" in l and l.strip().startswith("-")]
+        if not alvo:
+            continue
+        bl = git("blame", "--line-porcelain", rel)
+        tempos, ln = {}, None
+        if bl.returncode == 0:
+            for l in bl.stdout.splitlines():
+                mh = re.match(r"^[0-9a-f]{40} \d+ (\d+)", l)
+                if mh:
+                    ln = int(mh.group(1))
+                elif l.startswith("committer-time ") and ln is not None:
+                    tempos[ln] = int(l.split()[1])
+        for n in alvo:
+            ts = tempos.get(n)
+            if ts is None:
+                continue  # linha ainda não commitada: elo fresco
+            dias = (hoje - datetime.date.fromtimestamp(max(ts, MARCO_INSTALACAO))).days
+            if dias > TETO_ELO:
+                parados.append(f"elo {rel}:{n} há {dias}d")
+# (b) cruzamentos presos em status: semente (idade por git log do arquivo)
+cruz_dir = j("brain", "notas", "cruzamentos")
+if os.path.isdir(cruz_dir):
+    for fn in sorted(os.listdir(cruz_dir)):
+        if not fn.endswith(".md"):
+            continue
+        p = os.path.join(cruz_dir, fn)
+        rel = os.path.relpath(p, ROOT)
+        mfm = re.match(r"^---\n(.*?)\n---", read(p), re.S)
+        if not mfm or campo_esc(mfm.group(1), "status") != "semente":
+            continue
+        r = git("log", "-1", "--format=%ct", "--", rel)
+        ts = r.stdout.strip()
+        t = int(ts) if ts else int(os.path.getmtime(p))
+        dias = (hoje - datetime.date.fromtimestamp(t)).days
+        if dias > TETO_ELO:
+            parados.append(f"cruzamento-semente {rel} há {dias}d")
+if parados:
+    warn(f"cruzamentos/elos: {len(parados)} parado(s) >{TETO_ELO}d "
+         "(promova a [[wikilink]]/status maduro ou descarte): " + "; ".join(parados))
+else:
+    pass_(f"cruzamentos/elos: nenhum semente nem elo especulativo parado >{TETO_ELO}d")
+
+# ---- 11. Manutenção pendente -------------------------------------------------
+# Manutenção é ritual de sessão, não daemon: o TCC do macOS nega ao launchd ler
+# ~/Documents. O marco é o COMMIT, não um stamp: stamp que avança antes do
+# trabalho perde o trabalho se o run falhar no meio.
+pend = []
+# Auto-commit que só toca o ledger é o coletor trabalhando, não sessão sem /fim.
+vazados = oslib.autocommits_sem_fim(ROOT)
+if vazados:
+    pend.append(f"{len(vazados)} auto-commit(s) sem /fim (/destilar)")
+
+retro = oslib.retro_devida(ROOT)
+if retro:
+    pend.append(f"{retro} (/retrospectiva)")
+if pend:
+    warn("manutenção: " + "; ".join(pend))
+else:
+    pass_("manutenção: destilação e retrospectiva em dia")
+
+# ---- 12. Automação da abertura ------------------------------------------------
+# O heartbeat faz as vezes de um daemon: precisa existir, ser executável
+# e estar pendurado no SessionStart — senão o ritual volta a depender de memória.
+probs12 = []
+for nome in ("heartbeat", "radar", "oslib.py", "auto-commit", "retomada"):
+    p = j(".claude", "bin", nome)
+    if not os.path.isfile(p):
+        probs12.append(f"{nome} ausente")
+    elif nome != "oslib.py" and not os.access(p, os.X_OK):
+        probs12.append(f"{nome} sem +x")
+def comandos_do_evento(cfg, evento):
+    return " ".join(h.get("command", "") for bloco in (cfg.get("hooks") or {}).get(evento) or []
+                    for h in bloco.get("hooks") or [])
+try:
+    import json as json12
+    cfg12 = json12.loads(read(j(".claude", "settings.json")))
+    if "bin/heartbeat" not in comandos_do_evento(cfg12, "SessionStart"):
+        probs12.append("heartbeat fora do SessionStart em .claude/settings.json")
+    if "bin/auto-commit" not in comandos_do_evento(cfg12, "SessionEnd"):
+        probs12.append("auto-commit fora do SessionEnd em .claude/settings.json")
+    if "bin/retomada" not in comandos_do_evento(cfg12, "PreCompact"):
+        probs12.append("retomada fora do PreCompact em .claude/settings.json")
+except (OSError, ValueError, AttributeError):
+    probs12.append(".claude/settings.json ilegível")
+if probs12:
+    fail("automação da abertura e do fechamento: " + "; ".join(probs12))
+else:
+    pass_("automação da abertura e do fechamento: heartbeat (que chama o radar) no SessionStart, auto-commit no SessionEnd, retomada no PreCompact")
+
+# ---- 13. zsh do Bash tool -------------------------------------------------------
+# O Bash tool roda `/bin/zsh -c` NÃO-interativo; a cada chamada só ~/.zshenv é lido.
+# Com EQUALS e NOMATCH ligados, `echo ====` e glob sem match abortam a linha inteira.
+# O conserto vive FORA do repo (~/.zshenv), por isso o check é comportamental: mesmo
+# modo do tool (-c, não -l: receita posta no .zprofile passaria aqui sem valer lá).
+# Quem põe a receita lá é `.claude/bin/instalar` (bloco em .claude/zshenv-bloco.zsh).
+RECEITA13 = "[[ -o interactive ]] || unsetopt EQUALS NOMATCH"
+try:
+    with tempfile.TemporaryDirectory() as vazio13:  # cwd vazio: nada-*.x nunca casa
+        z13 = subprocess.run(["/bin/zsh", "-c", "echo ====; ls nada-*.x 2>/dev/null; echo ok"],
+                             capture_output=True, text=True, timeout=10, cwd=vazio13)
+    linhas13 = z13.stdout.strip().splitlines()
+    if linhas13 and linhas13[-1] == "ok":
+        pass_("zsh do Bash tool: `echo ====` e glob sem match não abortam a linha (~/.zshenv)")
+    else:
+        erro13 = (z13.stderr.strip().splitlines() or ["sem saída"])[-1][:80]
+        fail(f"zsh do Bash tool: a linha abortou ({erro13}) — rodar .claude/bin/instalar (põe no ~/.zshenv: {RECEITA13})")
+except (OSError, subprocess.TimeoutExpired) as e13:
+    fail(f"zsh do Bash tool: não deu para rodar /bin/zsh ({type(e13).__name__}) — conferir ~/.zshenv: {RECEITA13}")
+
+# ---- 14. timeout no Bash tool --------------------------------------------------
+# O macOS não tem `timeout` (GNU coreutils) e o modelo o escreve por reflexo de Linux.
+# A reserva vive no ~/.zshenv (perl: fork, grupo próprio, TERM/KILL no grupo) e sai 124
+# no estouro, como o GNU. O bloco exato, para repor: .claude/zshenv-bloco.zsh.
+try:
+    z14 = subprocess.run(["/bin/zsh", "-c", "timeout 1 sleep 3; echo $?"],
+                         capture_output=True, text=True, timeout=10)
+    saida14 = (z14.stdout.strip().splitlines() or [""])[-1]
+    if saida14 == "124":
+        pass_(f"timeout no Bash tool: corta no prazo (saiu {saida14})")
+    else:
+        erro14 = (z14.stderr.strip().splitlines() or [f"saiu {saida14 or 'vazio'}"])[-1][:80]
+        fail(f"timeout no Bash tool: não corta em 124 ({erro14}) — rodar .claude/bin/instalar "
+             "(repõe no ~/.zshenv o bloco de .claude/zshenv-bloco.zsh)")
+except (OSError, subprocess.TimeoutExpired) as e14:
+    fail(f"timeout no Bash tool: não deu para rodar /bin/zsh ({type(e14).__name__}) — conferir ~/.zshenv")
+
+# ---- 15. Camada OS suja há dias ------------------------------------------------
+# Com outra aba viva, o auto-commit do SessionEnd comita só o que a sessão que fecha
+# tocou; o que o heurístico não enxerga fica sujo e calado.
+# O ledger do coletor está sempre sujo por desenho: fora. O que ficou de fora em cada
+# fechamento está em .claude/abas/auto-commit.log.
+SUJO_DIAS = 2
+st15 = git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "brain", "STATUS.md", "CLAUDE.md", ".claude").stdout
+velhos15 = []
+campos15, i15 = st15.split("\0"), 0
+while i15 < len(campos15):
+    item15 = campos15[i15]
+    i15 += 1
+    if len(item15) < 4:
+        continue
+    if "R" in item15[:2] or "C" in item15[:2]:
+        i15 += 1                                # -z: a origem do rename vem no campo seguinte
+    rel15 = item15[3:]                          # rename: data-se o destino
+    if rel15 == ".claude/melhoria/ledger.jsonl":
+        continue
+    try:
+        if time.time() - os.path.getmtime(j(rel15)) > SUJO_DIAS * 86400:
+            velhos15.append(rel15)
+    except OSError:
+        continue                                # apagado: sem mtime, não dá para datar (lacuna aceita)
+if velhos15:
+    warn(f"camada OS suja há >{SUJO_DIAS} dias, sem dono à vista: {', '.join(sorted(velhos15)[:5])}"
+         + (f" (+{len(velhos15) - 5})" if len(velhos15) > 5 else "")
+         + " — comitar pelo /fim de quem tocou, ou ver .claude/abas/auto-commit.log")
+else:
+    pass_(f"camada OS: nada sujo há mais de {SUJO_DIAS} dias (fora o ledger)")
+
+# ---- 16. Guardas globais --------------------------------------------------------
+# A guarda (nega push forçado, segredo em commit, rm -r em pasta protegida; pergunta
+# antes do que sai da máquina) e o coletor de melhoria moram em ~/.claude/settings.json,
+# por caminho ABSOLUTO, para valer em sessão aberta fora da raiz. Quem os põe lá é o
+# `instalar`. Pasta renomeada ou máquina nova = hook apontando para o vazio, em silêncio.
+try:
+    import json as json16
+    cfg16 = json16.loads(read(os.path.join(HOME, ".claude", "settings.json")))
+except (OSError, ValueError):
+    cfg16 = {}
+faltam16 = []
+for evento16, alvo16, nome16 in (("PreToolUse", j(".claude", "bin", "guarda"), "guarda"),
+                                 ("SessionStart", j(".claude", "bin", "guarda"), "aviso de sessão fora da raiz"),
+                                 ("SessionEnd", j(".claude", "bin", "melhoria-scan.py"), "coletor de melhoria")):
+    if alvo16 not in (comandos_do_evento(cfg16, evento16) if isinstance(cfg16, dict) else ""):
+        faltam16.append(nome16)
+if not os.access(j(".claude", "bin", "guarda"), os.X_OK):
+    faltam16.append("guarda sem +x")
+if faltam16:
+    fail("guardas globais: fora do ~/.claude/settings.json ou apontando para outra pasta: "
+         + ", ".join(faltam16) + " — rodar .claude/bin/instalar")
+else:
+    pass_("guardas globais: guarda, aviso de fora da raiz e coletor de melhoria no ~/.claude/settings.json")
+
+# ---- saída -------------------------------------------------------------------
+houve_fail = False
+for nivel, msg in results:
+    print(f"{nivel} — {msg}")
+    houve_fail = houve_fail or nivel == "FAIL"
+sys.exit(1 if houve_fail else 0)
+PY

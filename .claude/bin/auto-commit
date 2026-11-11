@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""Auto-commit da camada OS no SessionEnd.
+
+Sem outra aba viva: add de brain, STATUS.md, CLAUDE.md e .claude e commit `--only` desses
+caminhos (o índice de terceiros não vai junto). Com outra aba viva — ou na dúvida —
+comita SÓ os caminhos da camada OS que ESTA sessão tocou (Edit/Write, Bash que escreve
+no caminho, `memoria add`, subagentes inclusive), mais o `.claude/melhoria/ledger.jsonl`
+(append-only, do coletor). Lista vazia: não comita. O que ficou de fora vai para
+`.claude/abas/auto-commit.log` (fora do git), e o `doctor` acusa camada OS suja há dias.
+
+Nunca sai com código ≠ 0 nem passa de ~12 s: fim de sessão não bloqueia.
+
+  auto-commit < payload.json  lê o JSON do SessionEnd no stdin (hook)
+  auto-commit --dry-run       idem, só imprime o que comitaria
+  auto-commit --selftest      testes embutidos; exit 0 se tudo passa
+"""
+import glob, importlib.machinery, importlib.util, json, os, re, signal, subprocess, sys, tempfile, time
+from datetime import datetime, timezone
+
+RAIZ = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+CAMADA = ("brain", "STATUS.md", "CLAUDE.md", ".claude")
+LEDGER = ".claude/melhoria/ledger.jsonl"
+LOG = os.path.join(".claude", "abas", "auto-commit.log")
+MENSAGEM = ["-m", "sessão: auto-commit (SessionEnd)", "-m", "Co-Authored-By: Claude <noreply@anthropic.com>"]
+
+
+def git(raiz, *args):
+    """git com prazo de 10 s; no estouro, TERM antes de KILL — o git limpa o index.lock no TERM."""
+    p = subprocess.Popen(["git", "-C", raiz] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = p.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.terminate()
+        try:
+            out, err = p.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, err = p.communicate()
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+
+def sujos(raiz):
+    """Caminhos da camada OS modificados, novos ou apagados (relativos à raiz).
+    Rename/cópia devolve destino E origem, para o commit não deixar a origem em stage."""
+    r = git(raiz, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *CAMADA)
+    campos = (r.stdout or "").split("\0")
+    saida, i = [], 0
+    while i < len(campos):
+        item = campos[i]
+        i += 1
+        if len(item) < 4:
+            continue
+        estado, caminho = item[:2], item[3:]
+        saida.append(caminho)
+        if "R" in estado or "C" in estado:
+            if i < len(campos) and campos[i]:
+                saida.append(campos[i])      # -z: a origem vem no campo seguinte
+            i += 1
+    return saida
+
+
+# Bash que ESCREVE. Só citar o caminho (`cat`, `grep`) não conta — senão a leitura de uma
+# nota de outra aba a levaria. Redireção conta, menos `2>`, `>&` e `> /dev/null`.
+ESCRITA_RX = re.compile(
+    r"(?<![-0-9&>=])>>?(?![&=])(?!\s*/dev/null)|\bsed\s+-i|\bperl\s+-\S*i|\btee\b|\btouch\s|"
+    r"\.write\(|write_text\(|write_bytes\(|\bmv\s|\bcp\s|\brm\s|\bln\s|\bunlink\b|"
+    r"shutil\.|os\.(?:rename|replace|remove)\(|open\([^)]*,\s*(?:mode\s*=\s*)?['\"][wax+]|"
+    r"\bgit\s+(?:mv|rm|apply|checkout|restore)\b|\bcurl\b[^|;&]*\s-o\s")
+MEMORIA_ADD_RX = re.compile(r"\bmemoria\s+add\s+([A-Za-z0-9_.-]+)")
+
+
+def tocados(raiz, transcripts):
+    """(caminhos relativos editados por Edit/Write, textos de Bash que escrevem)."""
+    editados, comandos = set(), []
+    for t in transcripts:
+        try:
+            f = open(t, encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        with f:
+            for linha in f:
+                if '"tool_use"' not in linha:
+                    continue
+                try:
+                    blocos = (json.loads(linha).get("message") or {}).get("content") or []
+                except Exception:
+                    continue
+                for b in blocos if isinstance(blocos, list) else []:
+                    if not isinstance(b, dict) or b.get("type") != "tool_use":
+                        continue
+                    entrada = b.get("input") or {}
+                    if b.get("name") in ("Edit", "Write", "NotebookEdit"):
+                        fp = entrada.get("file_path") or entrada.get("notebook_path") or ""
+                        if fp:
+                            editados.add(os.path.relpath(os.path.realpath(fp), raiz))
+                    elif b.get("name") == "Bash":
+                        cmd = entrada.get("command") or ""
+                        for slug in MEMORIA_ADD_RX.findall(cmd):
+                            editados.add("brain/memoria/%s.md" % slug)
+                            editados.add("brain/memoria/MEMORY.md")
+                        if ESCRITA_RX.search(cmd):
+                            comandos.append(cmd)
+    return editados, comandos
+
+
+def citado(raiz, caminho, cmd):
+    """O caminho aparece no comando como caminho próprio — `site-x/STATUS.md` não é `STATUS.md`."""
+    fim = r"(?![\w.-])"
+    if re.search(re.escape(raiz.rstrip("/") + "/" + caminho) + fim, cmd):
+        return True
+    return re.search(r"(?:^|[\s'\"=(:,<>{]|\./)" + re.escape(caminho) + fim, cmd) is not None
+
+
+def escolher(raiz, transcripts, candidatos):
+    """Dos `candidatos`, os que algum dos `transcripts` tocou, mais o ledger."""
+    editados, comandos = tocados(raiz, transcripts)
+    saida = []
+    for c in candidatos:
+        if c == LEDGER or c in editados or any(citado(raiz, c, cmd) for cmd in comandos):
+            saida.append(c)
+    return saida
+
+
+def ha_outra_aba(session_id, meu_pid, vivas, pids_vivos):
+    """True se há outra aba viva. Sem achar o próprio processo (ps falhou, `comm` ≠ claude,
+    rodado à mão), não dá para saber: True, porque o modo restrito é o seguro."""
+    if not meu_pid or meu_pid not in pids_vivos:
+        return True
+    for a in vivas:
+        if a.get("session_id") == session_id or a.get("pid") == meu_pid:
+            continue
+        return True
+    return False
+
+
+def outras_abas_vivas(session_id):
+    try:
+        caminho = os.path.join(RAIZ, ".claude", "bin", "abas")
+        carregador = importlib.machinery.SourceFileLoader("abas_mod", caminho)
+        spec = importlib.util.spec_from_loader("abas_mod", carregador)
+        abas = importlib.util.module_from_spec(spec)
+        carregador.exec_module(abas)
+        pids = abas.pids_claude_vivos()
+        return ha_outra_aba(session_id, abas.pid_do_claude(), abas.fundir(abas.ler(), pids), pids)
+    except Exception:
+        return True
+
+
+def transcripts_da_sessao(transcript_path):
+    if not transcript_path:
+        return []
+    base = transcript_path[:-6] if transcript_path.endswith(".jsonl") else transcript_path
+    return [transcript_path] + sorted(glob.glob(os.path.join(base, "subagents", "*.jsonl")))
+
+
+def commitar(raiz, caminhos):
+    """Commit `--only` dos caminhos; 3 tentativas se outra aba segura o index.lock."""
+    if not caminhos:
+        return False
+    # `git add` de um caminho que sumiu do disco E do índice (origem de `git mv`) aborta o
+    # add inteiro; os sumidos vão por `rm --cached`, que tolera o que já não está lá.
+    no_disco = [c for c in caminhos if os.path.lexists(os.path.join(raiz, c))]
+    sumidos = [c for c in caminhos if c not in no_disco]
+    for tentativa in range(3):
+        erros = ""
+        if no_disco:
+            erros += git(raiz, "add", "--", *no_disco).stderr or ""
+        if sumidos:
+            erros += git(raiz, "rm", "-q", "--cached", "--ignore-unmatch", "--", *sumidos).stderr or ""
+        # o que já não difere do HEAD (adicionado e apagado, sumido no meio) derrubaria o
+        # pathspec do `commit --only` e deixaria o resto em stage, sem commit
+        alvo = [c for c in caminhos if c in set(sujos(raiz))]
+        if not alvo:
+            return False
+        r = git(raiz, "commit", "-q", "--only", *MENSAGEM, "--", *alvo)
+        if r.returncode == 0:
+            return True
+        if "index.lock" not in erros + (r.stderr or ""):
+            return False
+        time.sleep(0.3)
+    return False
+
+
+def plano(raiz, session_id, transcript_path, outras):
+    candidatos = sujos(raiz)
+    if not outras:
+        return candidatos, []
+    meus = escolher(raiz, transcripts_da_sessao(transcript_path), candidatos)
+    return meus, [c for c in candidatos if c not in meus]
+
+
+def registrar(raiz, session_id, fora, falhou=None):
+    """Log fora do git: o que ficou de fora de propósito e o commit que falhou."""
+    if not fora and not falhou:
+        return
+    rec = {"ts": datetime.now(timezone.utc).isoformat(), "session_id": session_id, "fora": fora}
+    if falhou:
+        rec["falhou"] = falhou
+    try:
+        os.makedirs(os.path.join(raiz, ".claude", "abas"), exist_ok=True)
+        with open(os.path.join(raiz, LOG), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def modo_hook(dry):
+    if sys.stdin.isatty():
+        print(__doc__.strip())
+        return
+    try:
+        dados = json.load(sys.stdin)
+    except Exception:
+        dados = {}
+    raiz = os.environ.get("CLAUDE_PROJECT_DIR") or dados.get("cwd") or RAIZ
+    if not os.path.exists(os.path.join(raiz, ".git")):   # .git é arquivo num worktree
+        return
+    sid = dados.get("session_id") or ""
+    outras = outras_abas_vivas(sid)
+    meus, fora = plano(raiz, sid, dados.get("transcript_path") or "", outras)
+    if dry:
+        print("outras abas vivas: %s" % ("sim" if outras else "não"))
+        for c in meus:
+            print("  comitaria: " + c)
+        for c in fora:
+            print("  fica de fora: " + c)
+        if not meus:
+            print("  nada a comitar")
+        return
+    ok = commitar(raiz, meus)
+    registrar(raiz, sid, fora, falhou=None if ok or not meus else meus)
+
+
+# ---- selftest -------------------------------------------------------------------
+
+def _tool_use(nome, entrada):
+    return json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "x", "name": nome, "input": entrada}]}}, ensure_ascii=False)
+
+
+def _repo(tmp, arquivos):
+    raiz = os.path.realpath(os.path.join(tmp, "raiz"))
+    for rel in arquivos:
+        os.makedirs(os.path.dirname(os.path.join(raiz, rel)), exist_ok=True)
+        with open(os.path.join(raiz, rel), "w") as f:
+            f.write("v1\n")
+    git(raiz, "init", "-q")
+    git(raiz, "config", "user.email", "t@t")
+    git(raiz, "config", "user.name", "t")
+    git(raiz, "add", "-A")
+    git(raiz, "commit", "-q", "-m", "base")
+    return raiz
+
+
+def modo_selftest():
+    falhas = []
+
+    def confere(nome, obtido, esperado):
+        if obtido != esperado:
+            falhas.append("%s: obtido %r, esperado %r" % (nome, obtido, esperado))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        arquivos = ["brain/notas/a.md", "brain/notas/b.md", "brain/notas/c.md", "brain/notas/d.md",
+                    "brain/notas/com espaço é.md", "brain/notas/velho.md", "brain/notas/some.md",
+                    "STATUS.md", LEDGER, "brain/memoria/MEMORY.md"]
+        raiz = _repo(tmp, arquivos)
+        for rel in arquivos[:5] + ["STATUS.md", LEDGER, "brain/memoria/MEMORY.md"]:
+            with open(os.path.join(raiz, rel), "a") as f:
+                f.write("v2\n")
+        with open(os.path.join(raiz, "brain", "memoria", "nova-x.md"), "w") as f:
+            f.write("nova\n")
+        git(raiz, "mv", "brain/notas/velho.md", "brain/notas/novo.md")
+        os.remove(os.path.join(raiz, "brain/notas/some.md"))
+
+        principal = os.path.join(tmp, "sessao.jsonl")
+        with open(principal, "w") as f:
+            f.write(_tool_use("Edit", {"file_path": os.path.join(raiz, "brain/notas/a.md")}) + "\n")
+            f.write(_tool_use("Bash", {"command": "python3 - <<'EOF'\np='brain/notas/b.md'\n"
+                                                  "open(p,'w').write(s)\nEOF"}) + "\n")
+            f.write(_tool_use("Bash", {"command": "cat brain/notas/c.md 2>/dev/null; grep -n x STATUS.md "
+                                                  ">/dev/null; open('arquivo.md')"}) + "\n")
+            f.write(_tool_use("Bash", {"command": "echo x > site-x/STATUS.md"}) + "\n")
+            f.write(_tool_use("Bash", {"command": ".claude/bin/memoria add nova-x \"Nova\" \"gancho\" <<'EOF'\nc\nEOF"}) + "\n")
+            f.write(_tool_use("Bash", {"command": "git mv brain/notas/velho.md brain/notas/novo.md; "
+                                                  "rm brain/notas/some.md"}) + "\n")
+            f.write(_tool_use("Write", {"file_path": os.path.join(raiz, "brain/notas/com espaço é.md")}) + "\n")
+            f.write("linha que não é json\n")
+        sub = os.path.join(tmp, "sessao", "subagents")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "agent-1.jsonl"), "w") as f:
+            f.write(_tool_use("Write", {"file_path": os.path.join(raiz, "brain/notas/d.md")}) + "\n")
+
+        meus, fora = plano(raiz, "s", principal, outras=True)
+        esperado_meus = sorted(["brain/notas/a.md", "brain/notas/b.md", "brain/notas/d.md",
+                                "brain/notas/com espaço é.md", "brain/notas/novo.md", "brain/notas/velho.md",
+                                "brain/notas/some.md", "brain/memoria/nova-x.md", "brain/memoria/MEMORY.md",
+                                LEDGER])
+        confere("com outra aba: só o desta sessão + ledger", sorted(meus), esperado_meus)
+        confere("com outra aba: o resto fica de fora", sorted(fora), ["STATUS.md", "brain/notas/c.md"])
+        tudo, nada = plano(raiz, "s", principal, outras=False)
+        confere("sem outra aba: tudo", sorted(tudo), sorted(esperado_meus + ["STATUS.md", "brain/notas/c.md"]))
+        confere("sem outra aba: nada de fora", nada, [])
+        confere("transcript ausente: só o ledger",
+                plano(raiz, "s", os.path.join(tmp, "nada.jsonl"), outras=True)[0], [LEDGER])
+
+        # o commit restrito não leva o índice de outra aba: c.md fica sujo mesmo já em stage
+        git(raiz, "add", "--", "brain/notas/c.md")
+        confere("commit feito", commitar(raiz, meus), True)
+        no_commit = sorted(git(raiz, "-c", "core.quotepath=false", "show", "--no-renames", "--name-only", "--format=",
+                               "HEAD").stdout.splitlines())
+        confere("commit leva os escolhidos (rename e apagado inclusive)", no_commit, esperado_meus)
+        confere("o resto segue sujo, e a origem do rename não ficou em stage",
+                sorted(sujos(raiz)), ["STATUS.md", "brain/notas/c.md"])
+        confere("mensagem intacta (oslib procura por ela)",
+                git(raiz, "log", "-1", "--format=%s").stdout.strip(), "sessão: auto-commit (SessionEnd)")
+        confere("lista vazia não comita", commitar(raiz, []), False)
+
+        registrar(raiz, "s", ["STATUS.md"], falhou=["x.md"])
+        with open(os.path.join(raiz, LOG), encoding="utf-8") as f:
+            rec = json.loads(f.readline())
+        confere("o que ficou de fora vai para o log", (rec["fora"], rec["falhou"]), (["STATUS.md"], ["x.md"]))
+
+        # caminho que já não difere do HEAD não derruba o commit do resto
+        with open(os.path.join(raiz, "brain/notas/ad.md"), "w") as f:
+            f.write("novo\n")
+        git(raiz, "add", "--", "brain/notas/ad.md")
+        os.remove(os.path.join(raiz, "brain/notas/ad.md"))          # estado AD
+        with open(os.path.join(raiz, "brain/notas/a.md"), "a") as f:
+            f.write("v3\n")
+        confere("AD + modificado: comita o modificado", commitar(raiz, ["brain/notas/ad.md", "brain/notas/a.md",
+                                                                       "brain/notas/sumiu.md"]), True)
+        confere("AD + modificado: nada fica em stage", git(raiz, "diff", "--cached", "--name-only").stdout.strip(),
+                "brain/notas/c.md")
+
+    # fronteira do caminho citado
+    r_ = "/r"
+    confere("absoluto com sufixo não é o caminho", citado(r_, "STATUS.md", "cp /r/STATUS.md.bak x"), False)
+    confere("absoluto é", citado(r_, "STATUS.md", "echo x > /r/STATUS.md"), True)
+    confere("redireção colada é", citado(r_, "STATUS.md", "echo x >STATUS.md"), True)
+    confere("./ é", citado(r_, "STATUS.md", "echo x > ./STATUS.md"), True)
+    confere("de outro repo não é", citado(r_, "STATUS.md", "echo x > site-x/STATUS.md"), False)
+
+    # detecção de outra aba: sem achar o próprio pid, restrito
+    eu = {"session_id": "s", "pid": 10}
+    outra = {"session_id": "t", "pid": 11}
+    sem_registro = {"session_id": None, "pid": 10}
+    confere("só eu viva", ha_outra_aba("s", 10, [eu], [10]), False)
+    confere("eu já desregistrada pelo hook-end", ha_outra_aba("s", 10, [sem_registro], [10]), False)
+    confere("outra viva", ha_outra_aba("s", 10, [eu, outra], [10, 11]), True)
+    confere("ps falhou (sem pids)", ha_outra_aba("s", 10, [], []), True)
+    confere("meu pid desconhecido", ha_outra_aba("s", None, [eu], [10]), True)
+
+    if falhas:
+        for f in falhas:
+            print("FALHA — " + f)
+        sys.exit(1)
+    print("selftest ok")
+
+
+def _estouro(*_):
+    os._exit(0)                              # passou do prazo: sai calado, nunca bloqueia
+
+
+def main(argv):
+    if "--selftest" in argv:
+        modo_selftest()
+        return
+    signal.signal(signal.SIGALRM, _estouro)
+    signal.alarm(12)                         # o hook tem 15 s
+    try:
+        modo_hook("--dry-run" in argv)
+    except Exception:
+        pass                                 # nunca bloquear o fim da sessão
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

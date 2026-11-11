@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""instalar — liga este clone do OS à máquina. Roda quantas vezes quiser: não duplica nada.
+
+  instalar "<Seu nome>"   primeira vez: carimba o nome e liga tudo
+  instalar                de novo (pasta renomeada, máquina nova, doctor reclamou)
+  instalar --selftest     testes embutidos, numa pasta pessoal de mentira
+
+O que ele faz, nesta ordem, e onde mexe FORA da pasta do OS:
+  1. Troca {{NOME}} e {{OS}} nos arquivos do OS pelo seu nome e pelo nome da pasta.
+  2. Cria as pastas que ficam fora do git: brain/privado/ e arquivo/.
+  3. Memória: faz ~/.claude/projects/<pasta>/memory apontar para brain/memoria/, para a
+     memória automática do Claude Code ficar versionada junto com o OS.
+  4. ~/.zshenv: acrescenta o bloco de .claude/zshenv-bloco.zsh (uma vez; cópia de
+     segurança antes). Sem ele o Bash tool aborta linhas em silêncio.
+  5. ~/.claude/settings.json: registra a guarda, o aviso de sessão fora da raiz, o
+     registro de abas e o coletor de melhoria (cópia de segurança antes). São globais
+     para valer também em sessão aberta fora da raiz. O coletor só anota sessão aberta
+     dentro da pasta do OS. Hook de outra instalação que exista na máquina não é tocado.
+  6. Roda o doctor e mostra a saída.
+
+Nunca apaga nada: o que precisa sair do caminho é renomeado com data.
+"""
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+RAIZ = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+MARCA_INI = "# >>> os: bloco do Bash tool do Claude Code"
+MARCA_FIM = "# <<< os: bloco do Bash tool do Claude Code <<<"
+# Onde o nome pode aparecer. Scripts não levam nome: ficam de fora de propósito.
+ONDE_CARIMBAR = ("CLAUDE.md", "STATUS.md", "README.md", "brain", ".claude/skills", ".claude/commands", ".claude/agents")
+
+
+def slug_projeto(raiz):
+    """Nome da pasta do projeto em ~/.claude/projects: o caminho com tudo que não é letra
+    nem número trocado por `-` (medido: `x/.claude/worktrees` vira `x--claude-worktrees`)."""
+    return re.sub(r"[^A-Za-z0-9-]", "-", raiz)
+
+
+def agora():
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def validar_raiz(raiz):
+    """Só o que sabemos converter em nome de pasta de projeto sem adivinhar."""
+    if not re.match(r"^[A-Za-z0-9/. -]+$", raiz):
+        return ("o caminho da pasta do OS tem caractere fora de letras sem acento, números, ponto, hífen e "
+                "espaço: %s — renomeie a pasta (ex.: ~/Documents/OS) e rode de novo. Se o caractere está no "
+                "nome da sua conta do Mac (/Users/<conta>), renomear a pasta não resolve: avise quem te passou "
+                "o OS" % raiz)
+    return None
+
+
+def carimbar(raiz, nome):
+    """Troca {{NOME}} e {{OS}}. Devolve (arquivos mudados, ainda há {{NOME}} sem nome dado)."""
+    os_nome = os.path.basename(raiz.rstrip("/"))
+    mudados, falta = [], False
+    for topo in ONDE_CARIMBAR:
+        base = os.path.join(raiz, topo)
+        arquivos = [base] if os.path.isfile(base) else [
+            os.path.join(d, f) for d, sub, fs in os.walk(base)
+            if not any(p in ("privado", "memoria") for p in os.path.relpath(d, raiz).split(os.sep))
+            for f in fs if f.endswith(".md")]
+        for p in arquivos:
+            try:
+                with open(p, encoding="utf-8") as f:
+                    txt = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            novo = txt.replace("{{OS}}", os_nome)
+            if nome:
+                novo = novo.replace("{{NOME}}", nome).replace("{{HOJE}}", datetime.date.today().isoformat())
+            elif "{{NOME}}" in novo:
+                falta = True
+            if novo != txt:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(novo)
+                mudados.append(os.path.relpath(p, raiz))
+    return mudados, falta
+
+
+def pastas_fora_do_git(raiz):
+    feitas = []
+    for rel in ("brain/privado", "arquivo", "brain/notas/projetos", "brain/notas/diario",
+                "brain/notas/semanas", "brain/notas/cruzamentos", "brain/notas/melhorias", ".claude/melhoria"):
+        p = os.path.join(raiz, rel)
+        if not os.path.isdir(p):
+            os.makedirs(p)
+            feitas.append(rel)
+    return feitas
+
+
+def ligar_memoria(raiz, home):
+    """Symlink ~/.claude/projects/<slug>/memory → brain/memoria. Devolve a frase do relatório."""
+    alvo = os.path.join(raiz, "brain", "memoria")
+    link = os.path.join(home, ".claude", "projects", slug_projeto(raiz), "memory")
+    if os.path.islink(link):
+        if os.path.realpath(link) == os.path.realpath(alvo):
+            return "memória: já apontava para brain/memoria/"
+        os.rename(link, link + ".antes-" + agora())
+    elif os.path.isdir(link):
+        if os.listdir(link):
+            guardada = link + ".antes-" + agora()
+            os.rename(link, guardada)
+            os.makedirs(os.path.dirname(link), exist_ok=True)
+            os.symlink(alvo, link)
+            return ("memória: ligada a brain/memoria/. Já havia memórias na pasta antiga; ficaram em "
+                    "%s — peça ao Claude para trazê-las com `.claude/bin/memoria add`" % guardada)
+        os.rmdir(link)
+    elif os.path.lexists(link):                       # arquivo comum no lugar da pasta: sai do caminho, não some
+        os.rename(link, link + ".antes-" + agora())
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    os.symlink(alvo, link)
+    return "memória: ~/.claude/projects/%s/memory → brain/memoria/" % slug_projeto(raiz)
+
+
+def ligar_zshenv(raiz, home):
+    bloco_p = os.path.join(raiz, ".claude", "zshenv-bloco.zsh")
+    with open(bloco_p, encoding="utf-8") as f:
+        bloco = f.read().strip("\n") + "\n"
+    destino = os.path.join(home, ".zshenv")
+    atual = ""
+    if os.path.isfile(destino):
+        with open(destino, encoding="utf-8", errors="replace") as f:
+            atual = f.read()
+    if MARCA_INI in atual and MARCA_FIM in atual:
+        ini = atual.index(MARCA_INI)
+        fim = atual.index(MARCA_FIM) + len(MARCA_FIM)
+        novo = atual[:ini] + bloco.rstrip("\n") + atual[fim:]
+        if novo == atual:
+            return "~/.zshenv: bloco já estava lá"
+    else:
+        if "unsetopt EQUALS NOMATCH" in atual and "timeout()" in atual:
+            return "~/.zshenv: já tinha a receita (posta à mão); não mexi"
+        novo = atual + ("" if not atual or atual.endswith("\n") else "\n") + ("\n" if atual else "") + bloco
+    if atual:
+        shutil.copy2(destino, destino + ".antes-" + agora())
+    real = os.path.realpath(destino)                  # ~/.zshenv pode ser link para uma pasta de dotfiles
+    tmp = real + ".tmp-os"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(novo)
+    os.replace(tmp, real)                             # troca de uma vez: queda no meio não deixa arquivo pela metade
+    return "~/.zshenv: bloco do Bash tool escrito" + (" (cópia de segurança ao lado)" if atual else "")
+
+
+def hooks_globais(raiz):
+    """{evento: [bloco, …]} com caminho ABSOLUTO: hook global não tem $CLAUDE_PROJECT_DIR da raiz."""
+    q = lambda p: '"%s"' % os.path.join(raiz, ".claude", "bin", p)
+    guarda = 'G=%s; [ -x "$G" ] || exit 0; "$G"' % q("guarda")
+    return {
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": guarda, "timeout": 20}]}],
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": guarda + " --fora", "timeout": 5}]},
+            {"hooks": [{"type": "command", "timeout": 10, "command": (
+                '[ -n "$CLAUDE_PROJECT_DIR" ] || exit 0; [ "$CLAUDE_PROJECT_DIR" = "%s" ] && exit 0; A=%s; '
+                '[ -x "$A" ] || exit 0; "$A" hook-start 2>/dev/null; exit 0' % (raiz, q("abas")))}]},
+        ],
+        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": guarda + " --fora", "timeout": 5}]}],
+        # Só sessão aberta DENTRO do OS entra no ledger: ele guarda o começo do primeiro pedido de
+        # cada sessão e é versionado. Sessão de outra pasta (outro cliente, assunto pessoal) fica fora.
+        "SessionEnd": [{"hooks": [{"type": "command", "timeout": 20, "command": (
+            'case "$CLAUDE_PROJECT_DIR" in "%s"|"%s"/*) ;; *) exit 0;; esac; M=%s; [ -f "$M" ] || exit 0; '
+            'python3 "$M"; exit 0' % (raiz, raiz, q("melhoria-scan.py")))}]}],
+    }
+
+
+SCRIPT_RX = re.compile(r"\"([^\"]*/\.claude/bin/(?:guarda|melhoria-scan\.py|abas))\"")
+
+
+def hook_a_trocar(comando, raiz):
+    """Caminho do script, se o hook é DESTA raiz (vai ser reescrito) ou aponta para script que não
+    existe mais (pasta renomeada). Hook de OUTRA instalação viva na máquina não é nosso: fica."""
+    for caminho in SCRIPT_RX.findall(comando or ""):
+        if caminho.endswith("/abas") and "hook-start" not in comando:
+            continue
+        if caminho.startswith(raiz.rstrip("/") + "/") or not os.path.exists(caminho):
+            return caminho
+    return None
+
+
+def ligar_settings(raiz, home):
+    destino = os.path.join(home, ".claude", "settings.json")
+    cfg, existia = {}, os.path.isfile(destino)
+    if existia:
+        with open(destino, encoding="utf-8") as f:
+            bruto = f.read()
+        try:
+            cfg = json.loads(bruto) if bruto.strip() else {}
+        except ValueError:
+            return None, ("~/.claude/settings.json: NÃO é JSON válido; não mexi. Conserte o arquivo e rode de novo "
+                          "(as guardas globais ficam desligadas até lá)")
+        if not isinstance(cfg, dict):
+            return None, "~/.claude/settings.json: formato inesperado; não mexi"
+    antes = json.dumps(cfg, sort_keys=True)
+    hooks = cfg.get("hooks")
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict):
+        return None, "~/.claude/settings.json: a chave `hooks` tem formato inesperado; não mexi"
+    orfaos, estranhos = [], []
+    for evento in list(hooks):
+        if not isinstance(hooks[evento], list):
+            estranhos.append(evento)                  # formato que não conhecemos: é dela, fica como está
+            continue
+        limpos = []
+        for b in hooks[evento]:
+            if not isinstance(b, dict) or not isinstance(b.get("hooks"), list):
+                limpos.append(b)
+                continue
+            hs = []
+            for h in b["hooks"]:
+                caminho = hook_a_trocar(h.get("command"), raiz) if isinstance(h, dict) else None
+                if caminho is None:
+                    hs.append(h)
+                elif not caminho.startswith(raiz.rstrip("/") + "/"):
+                    orfaos.append(caminho)
+            if hs or not b["hooks"]:
+                limpos.append({**b, "hooks": hs})
+        if limpos:
+            hooks[evento] = limpos
+        else:
+            del hooks[evento]
+    for evento, blocos in hooks_globais(raiz).items():
+        if evento not in estranhos:
+            hooks.setdefault(evento, []).extend(blocos)
+    cfg["hooks"] = hooks
+    extra = ""
+    if orfaos:
+        extra += ("; tirei %d hook(s) que apontavam para script que não existe mais: %s"
+                  % (len(orfaos), ", ".join(sorted(set(orfaos)))))
+    if estranhos:
+        extra += "; ATENÇÃO: não registrei em %s (formato que não reconheço; confira o arquivo)" % ", ".join(estranhos)
+    if json.dumps(cfg, sort_keys=True) == antes:
+        return cfg, "~/.claude/settings.json: guardas globais já estavam lá" + extra
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    if existia:
+        shutil.copy2(destino, destino + ".antes-" + agora())
+    tmp = destino + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, destino)
+    return cfg, ("~/.claude/settings.json: guardas globais registradas"
+                 + (" (cópia de segurança ao lado)" if existia else "") + extra)
+
+
+def instalar(raiz, home, nome):
+    """Lista de frases do relatório. Levanta SystemExit(2) com mensagem se não dá para seguir."""
+    erro = validar_raiz(raiz)
+    if erro:
+        raise SystemExit("instalar: " + erro)
+    rel = []
+    mudados, falta = carimbar(raiz, nome)
+    if falta:
+        raise SystemExit('instalar: o nome de quem é dono do OS ainda não foi dado — rode: .claude/bin/instalar "<Seu nome>"')
+    rel.append("nome: %d arquivo(s) carimbado(s)" % len(mudados) if mudados else "nome: já estava carimbado")
+    feitas = pastas_fora_do_git(raiz)
+    rel.append("pastas: " + (", ".join(feitas) + " criada(s)" if feitas else "todas no lugar"))
+    for script in os.listdir(os.path.join(raiz, ".claude", "bin")):
+        p = os.path.join(raiz, ".claude", "bin", script)
+        if os.path.isfile(p) and not script.endswith(".py") or script == "melhoria-scan.py":
+            os.chmod(p, os.stat(p).st_mode | 0o111)
+    rel.append(ligar_memoria(raiz, home))
+    rel.append(ligar_zshenv(raiz, home))
+    rel.append(ligar_settings(raiz, home)[1])
+    return rel
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    nome = " ".join(args).strip()
+    if nome and ("{{" in nome or "\n" in nome or len(nome) > 60):
+        raise SystemExit("instalar: nome inválido")
+    home = os.path.expanduser("~")
+    for frase in instalar(RAIZ, home, nome):
+        print("instalar — " + frase)
+    r = subprocess.run(["git", "-C", RAIZ, "remote", "get-url", "origin"], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        print("instalar — git: o `origin` deste clone é %s (se for o repositório-modelo, e não o seu, "
+              "remova com `git remote remove origin`)" % r.stdout.strip())
+    for chave in ("user.name", "user.email"):
+        if not subprocess.run(["git", "-C", RAIZ, "config", chave], capture_output=True, text=True).stdout.strip():
+            print("instalar — git: falta `git config --global %s …` (sem isso o commit do /fim falha)" % chave)
+    print("\n— doctor —")
+    sys.stdout.flush()
+    d = subprocess.run([os.path.join(RAIZ, ".claude", "bin", "doctor")])
+    sys.exit(d.returncode)
+
+
+# ---- testes embutidos --------------------------------------------------------------
+def _selftest():
+    # Pasta de teste com nome sob controle: o mkdtemp sorteia `_`, que a validação recusa.
+    tmp = os.path.join(os.path.realpath("/tmp"), "instalar-selftest-%d-%s" % (os.getpid(), os.urandom(4).hex()))
+    os.makedirs(tmp)
+    n = 0
+
+    def ok(cond, msg):
+        nonlocal n
+        assert cond, msg
+        n += 1
+
+    try:
+        home = os.path.join(tmp, "home")
+        raiz = os.path.join(home, "Documents", "Meu OS.v2")
+        os.makedirs(os.path.join(raiz, ".claude", "bin"))
+        os.makedirs(os.path.join(raiz, ".claude", "skills", "fim"))
+        os.makedirs(os.path.join(raiz, "brain", "memoria"))
+        shutil.copy(os.path.join(RAIZ, ".claude", "zshenv-bloco.zsh"), os.path.join(raiz, ".claude", "zshenv-bloco.zsh"))
+        with open(os.path.join(raiz, "CLAUDE.md"), "w") as f:
+            f.write("# CLAUDE.md — {{OS}}\n\nQuem decide é {{NOME}}.\n")
+        with open(os.path.join(raiz, "STATUS.md"), "w") as f:
+            f.write("## Fila de {{NOME}}\n")
+        with open(os.path.join(raiz, ".claude", "skills", "fim", "SKILL.md"), "w") as f:
+            f.write("só a pedido explícito de {{NOME}}\n")
+        with open(os.path.join(raiz, ".claude", "bin", "nota"), "w") as f:
+            f.write("#!/bin/bash\n# {{NOME}} não deve ser trocado em script\n")
+        with open(os.path.join(raiz, "brain", "memoria", "MEMORY.md"), "w") as f:
+            f.write("# MEMORY\n")
+
+        ok(slug_projeto("/Users/a.b/Documents/Meu OS") == "-Users-a-b-Documents-Meu-OS", "slug troca ponto e espaço")
+        ok(validar_raiz("/Users/ana/Documents/OS") is None, "caminho simples vale")
+        ok(validar_raiz("/Users/ana/Documentação/OS") is not None, "acento é recusado, com mensagem")
+        ok(validar_raiz("/Users/ana/meu_os") is not None, "sublinhado é recusado: não sabemos como vira nome de pasta")
+
+        # sem nome e com {{NOME}} pendente: para antes de mexer na máquina
+        try:
+            instalar(raiz, home, "")
+            ok(False, "devia ter parado sem nome")
+        except SystemExit as e:
+            ok("nome" in str(e), "sem nome: para e diz o que falta")
+        ok(not os.path.exists(os.path.join(home, ".zshenv")), "parou antes de tocar o ~/.zshenv")
+
+        # máquina com coisas da pessoa: nada dela pode sumir
+        os.makedirs(os.path.join(home, ".claude"))
+        outra = os.path.join(home, "Documents", "OutroOS", ".claude", "bin")     # outra instalação, viva
+        os.makedirs(outra)
+        for nome_s in ("guarda", "melhoria-scan.py", "abas"):
+            open(os.path.join(outra, nome_s), "w").close()
+        de_outra = ['G="%s/guarda"; [ -x "$G" ] || exit 0; "$G"' % outra, 'python3 "%s/melhoria-scan.py"' % outra]
+        dela = {"model": "opus", "permissions": {"allow": ["Bash(ls *)"]},
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo meu"},
+                                                                       {"type": "command", "command": de_outra[0]}]}],
+                          "SessionEnd": [{"hooks": [{"type": "command", "command": de_outra[1]}]}],
+                          "Notification": {"formato": "que não é lista"},
+                          "Stop": [{"hooks": [{"type": "command", "command": "say pronto"}]}]}}
+        with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
+            json.dump(dela, f)
+        with open(os.path.join(home, ".zshenv"), "w") as f:
+            f.write("export EDITOR=vim")                       # sem quebra de linha no fim, de propósito
+        velha = os.path.join(home, ".claude", "projects", slug_projeto(raiz), "memory")
+        os.makedirs(velha)
+        with open(os.path.join(velha, "antiga.md"), "w") as f:
+            f.write("fato antigo")
+
+        rel = instalar(raiz, home, "Ana Lima")
+        ler = lambda *p: open(os.path.join(*p), encoding="utf-8").read()
+        ok("Ana Lima" in ler(raiz, "CLAUDE.md") and "{{" not in ler(raiz, "CLAUDE.md"), "CLAUDE.md carimbado")
+        ok("# CLAUDE.md — Meu OS.v2" in ler(raiz, "CLAUDE.md"), "{{OS}} vira o nome da pasta")
+        ok(ler(raiz, "STATUS.md") == "## Fila de Ana Lima\n", "STATUS carimbado")
+        ok("Ana Lima" in ler(raiz, ".claude", "skills", "fim", "SKILL.md"), "skill carimbada")
+        ok("{{NOME}}" in ler(raiz, ".claude", "bin", "nota"), "script não é carimbado")
+        ok(os.path.isdir(os.path.join(raiz, "brain", "privado")) and os.path.isdir(os.path.join(raiz, "arquivo")),
+           "pastas fora do git criadas")
+        ok(os.path.islink(velha) and os.path.realpath(velha) == os.path.realpath(os.path.join(raiz, "brain", "memoria")),
+           "memória ligada a brain/memoria")
+        guardadas = [d for d in os.listdir(os.path.dirname(velha)) if d.startswith("memory.antes-")]
+        ok(len(guardadas) == 1 and os.path.isfile(os.path.join(os.path.dirname(velha), guardadas[0], "antiga.md")),
+           "memória antiga foi guardada, não apagada")
+        ok(any("memory.antes-" in f for f in rel), "o relatório diz onde a memória antiga ficou")
+
+        z = ler(home, ".zshenv")
+        ok(z.startswith("export EDITOR=vim\n") and z.count(MARCA_INI) == 1 and z.count(MARCA_FIM) == 1,
+           "zshenv: conteúdo dela preservado, bloco uma vez")
+        ok(len([f for f in os.listdir(home) if f.startswith(".zshenv.antes-")]) == 1, "zshenv: cópia de segurança")
+        zr = subprocess.run(["/bin/zsh", "-c", "echo ====; ls nada-*.x 2>/dev/null; timeout 1 sleep 3; echo $?"],
+                            capture_output=True, text=True, timeout=20, env={**os.environ, "HOME": home, "ZDOTDIR": home},
+                            cwd=tmp)
+        ok(zr.stdout.strip().splitlines()[-1:] == ["124"], "o bloco funciona num zsh de verdade: %r %r" % (zr.stdout, zr.stderr))
+
+        cfg = json.loads(ler(home, ".claude", "settings.json"))
+        ok(cfg["model"] == "opus" and cfg["permissions"] == dela["permissions"], "settings: o resto fica como estava")
+        cmds = lambda ev: [h["command"] for b in cfg["hooks"].get(ev, []) for h in b["hooks"]]
+        ok("echo meu" in cmds("PreToolUse") and "say pronto" in cmds("Stop"), "settings: hooks dela preservados")
+        ok(de_outra[0] in cmds("PreToolUse") and de_outra[1] in cmds("SessionEnd"),
+           "settings: hook de OUTRA instalação viva não é removido")
+        ok(cfg["hooks"]["Notification"] == {"formato": "que não é lista"}, "settings: formato desconhecido fica intocado")
+        fim_s = [c for c in cmds("SessionEnd") if raiz in c][0]
+        dentro = subprocess.run(["/bin/sh", "-c", fim_s.replace('python3 "$M"', "echo RODOU")], capture_output=True,
+                                text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": os.path.join(raiz, "site")})
+        fora_ = subprocess.run(["/bin/sh", "-c", fim_s.replace('python3 "$M"', "echo RODOU")], capture_output=True,
+                               text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": os.path.join(home, "Documents", "cliente")})
+        quase = subprocess.run(["/bin/sh", "-c", fim_s.replace('python3 "$M"', "echo RODOU")], capture_output=True,
+                               text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": raiz + "-copia"})
+        open(os.path.join(raiz, ".claude", "bin", "melhoria-scan.py"), "w").close()
+        dentro = subprocess.run(["/bin/sh", "-c", fim_s.replace('python3 "$M"', "echo RODOU")], capture_output=True,
+                                text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": os.path.join(raiz, "site")})
+        ok("RODOU" in dentro.stdout, "coletor roda em sessão dentro do OS: %r %r" % (dentro.stdout, dentro.stderr))
+        ok(fora_.stdout == "" and quase.stdout == "", "coletor NÃO roda em sessão de outra pasta (nem de pasta de nome parecido)")
+        g = os.path.join(raiz, ".claude", "bin", "guarda")
+        ok(sum(g in c for c in cmds("PreToolUse")) == 1, "guarda no PreToolUse, uma vez")
+        ok(sum(g in c and "--fora" in c for c in cmds("SessionStart")) == 1, "aviso de fora no SessionStart")
+        ok(sum("--fora" in c for c in cmds("UserPromptSubmit")) == 1, "aviso de fora no UserPromptSubmit")
+        ok(sum(raiz in c and "melhoria-scan.py" in c for c in cmds("SessionEnd")) == 1, "coletor no SessionEnd")
+        ok(sum("hook-start" in c for c in cmds("SessionStart")) == 1, "registro de abas no SessionStart")
+        bloco_pre = [b for b in cfg["hooks"]["PreToolUse"] if any(g in h["command"] for h in b["hooks"])][0]
+        ok(bloco_pre.get("matcher") == "Bash", "a guarda só olha Bash")
+
+        # o comando registrado funciona de verdade, com espaço e ponto no caminho
+        shutil.copy(os.path.join(RAIZ, ".claude", "bin", "guarda"), g)
+        os.chmod(g, 0o755)
+        cmd_guarda = [c for c in cmds("PreToolUse") if g in c][0]
+        hr = subprocess.run(["/bin/sh", "-c", cmd_guarda], capture_output=True, text=True, timeout=20,
+                            input=json.dumps({"tool_name": "Bash", "cwd": tmp, "tool_input": {"command": "git push -f"}}))
+        ok(hr.returncode == 0 and '"deny"' in hr.stdout, "hook registrado nega push forçado: %r %r" % (hr.stdout, hr.stderr))
+        os.remove(g)
+        hr = subprocess.run(["/bin/sh", "-c", cmd_guarda], capture_output=True, text=True, timeout=20, input="{}")
+        ok(hr.returncode == 0 and hr.stdout == "", "guarda ausente: o hook sai calado, não bloqueia o Bash")
+
+        # segunda vez: nada muda, nada duplica
+        antes = (ler(home, ".zshenv"), ler(home, ".claude", "settings.json"), ler(raiz, "CLAUDE.md"))
+        n_copias = len(os.listdir(os.path.join(home, ".claude")))
+        instalar(raiz, home, "")
+        ok(antes == (ler(home, ".zshenv"), ler(home, ".claude", "settings.json"), ler(raiz, "CLAUDE.md")), "idempotente")
+        ok(len(os.listdir(os.path.join(home, ".claude"))) == n_copias, "segunda vez não gera cópia de segurança nova")
+
+        # pasta renomeada: os hooks antigos saem, os novos entram, uma vez só
+        nova = os.path.join(home, "Documents", "OS")
+        os.rename(raiz, nova)
+        rel_rename = instalar(nova, home, "")
+        cfg = json.loads(ler(home, ".claude", "settings.json"))
+        todos = [h["command"] for bs in cfg["hooks"].values() if isinstance(bs, list) for b in bs for h in b["hooks"]]
+        ok(not any("Meu OS.v2" in c for c in todos), "rename: nenhum hook aponta para a pasta antiga")
+        ok(sum(nova + "/.claude/bin/guarda" in c for c in todos) == 3 and "echo meu" in todos,
+           "rename: guarda 3×, hook dela segue")
+        ok(de_outra[0] in todos and de_outra[1] in todos, "rename: hook da outra instalação segue")
+        ok(any("não existe mais" in f for f in rel_rename), "rename: o relatório diz que tirou hook órfão")
+        novo_link = os.path.join(home, ".claude", "projects", slug_projeto(nova), "memory")
+        ok(os.path.realpath(novo_link) == os.path.realpath(os.path.join(nova, "brain", "memoria")), "rename: memória religada")
+
+        # memory que é arquivo comum: sai do caminho, o instalador não morre
+        os.remove(novo_link)
+        with open(novo_link, "w") as f:
+            f.write("arquivo no lugar da pasta")
+        instalar(nova, home, "")
+        ok(os.path.islink(novo_link) and any(x.startswith("memory.antes-") and os.path.isfile(
+            os.path.join(os.path.dirname(novo_link), x)) for x in os.listdir(os.path.dirname(novo_link))),
+           "memory como arquivo: renomeado, link refeito")
+        # ~/.zshenv que é link para dotfiles: escreve no alvo, o link continua link
+        dot = os.path.join(home, "dotfiles")
+        os.makedirs(dot)
+        os.rename(os.path.join(home, ".zshenv"), os.path.join(dot, "zshenv"))
+        os.symlink(os.path.join(dot, "zshenv"), os.path.join(home, ".zshenv"))
+        with open(os.path.join(dot, "zshenv"), "w") as f:
+            f.write("export EDITOR=vim\n")
+        instalar(nova, home, "")
+        ok(os.path.islink(os.path.join(home, ".zshenv")) and MARCA_INI in ler(dot, "zshenv"),
+           "zshenv por link: o link continua link e o bloco vai para o alvo")
+
+        # settings quebrado: não sobrescreve
+        with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
+            f.write("{quebrado")
+        rel = instalar(nova, home, "")
+        ok(ler(home, ".claude", "settings.json") == "{quebrado" and any("NÃO é JSON" in f for f in rel),
+           "settings ilegível: não toca e avisa")
+        print("instalar selftest ok — %d asserts" % n)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        main()

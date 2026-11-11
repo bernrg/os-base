@@ -1,0 +1,1574 @@
+#!/usr/bin/env python3
+"""Painel das abas do Claude Code vivas sobre a raiz. Somente leitura."""
+import json, os, re, shlex, sys, subprocess, tempfile, shutil, time, fcntl
+from datetime import datetime, timezone
+
+RAIZ = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+REG = os.path.join(RAIZ, ".claude", "abas")
+
+
+def agora():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def vivo(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # existe, só não é nosso — vivo
+    except OSError:
+        return False
+    return True
+
+
+def escrever(rec):
+    os.makedirs(REG, exist_ok=True)
+    caminho = os.path.join(REG, "%s.json" % rec["session_id"])
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+
+
+def ler(podar=True):
+    saida = []
+    if not os.path.isdir(REG):
+        return saida
+    for nome in sorted(os.listdir(REG)):
+        if not nome.endswith(".json") or nome == "trinco.json":
+            continue
+        caminho = os.path.join(REG, nome)
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                rec = json.load(f)
+        except Exception:
+            continue                      # corrompido: ignora, nunca derruba
+        pid = rec.get("pid")
+        if not isinstance(pid, int) or not vivo(pid):
+            if podar:
+                try:
+                    os.remove(caminho)
+                except OSError:
+                    pass
+            continue
+        saida.append(rec)
+    return saida
+
+
+def _ps_pai(pid):
+    """Devolve (ppid, comm) de um PID, ou (None, "")."""
+    try:
+        r = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None, ""
+    linha = (r.stdout or "").strip()
+    if not linha:
+        return None, ""
+    partes = linha.split(None, 1)
+    try:
+        return int(partes[0]), (partes[1] if len(partes) > 1 else "")
+    except ValueError:
+        return None, ""
+
+
+def pid_do_claude():
+    pid = os.getpid()
+    for _ in range(12):                   # teto: nunca laçar na árvore de processos
+        ppid, _cmd = _ps_pai(pid)
+        if ppid is None or ppid <= 1:
+            return None
+        _avo, comm = _ps_pai(ppid)
+        if os.path.basename(comm.strip()) == "claude":
+            return ppid
+        pid = ppid
+    return None
+
+
+def limpar_pid(pid):
+    """Remove registros antigos do MESMO processo.
+
+    O SessionStart não dispara só na abertura da aba: o payload real traz um campo
+    `source` (medido: "startup"), e ele existe porque há outras origens — resume,
+    clear, compact. Todas nascem com session_id NOVO no MESMO PID. Sem esta limpeza,
+    cada /clear deixaria um registro órfão que a poda nunca remove (o PID segue vivo)
+    e o painel contaria a mesma aba duas vezes.
+    """
+    if not isinstance(pid, int) or not os.path.isdir(REG):
+        return
+    for nome in os.listdir(REG):
+        if not nome.endswith(".json"):
+            continue
+        caminho = os.path.join(REG, nome)
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                rec = json.load(f)
+        except Exception:
+            continue
+        if rec.get("pid") == pid:
+            try:
+                os.remove(caminho)
+            except OSError:
+                pass
+
+
+def pids_claude_vivos():
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,comm="], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    pids = []
+    for linha in (r.stdout or "").splitlines():
+        partes = linha.split(None, 1)
+        if len(partes) < 2:
+            continue
+        if os.path.basename(partes[1].strip()) == "claude":
+            try:
+                pids.append(int(partes[0]))
+            except ValueError:
+                pass
+    return sorted(pids)
+
+
+def fundir(registros, pids):
+    por_pid = dict((r["pid"], r) for r in registros if isinstance(r.get("pid"), int))
+    saida = []
+    for pid in pids:
+        r = por_pid.get(pid)
+        if r is None:
+            saida.append({"pid": pid, "session_id": None, "apelido": None,
+                          "inicio": None, "transcript": "", "cwd": "", "registrada": False})
+        else:
+            saida.append({"pid": pid, "session_id": r.get("session_id"),
+                          "apelido": r.get("apelido"), "inicio": r.get("inicio"),
+                          "transcript": r.get("transcript") or "", "cwd": r.get("cwd") or "",
+                          "registrada": True})
+    return saida
+
+
+def abas_vivas():
+    return fundir(ler(), pids_claude_vivos())
+
+
+CAMPOS_ARQUIVO = ("file_path", "notebook_path")
+
+
+def projetos_validos():
+    try:
+        nomes = os.listdir(RAIZ)
+    except OSError:
+        return []
+    return sorted(n for n in nomes if os.path.isdir(os.path.join(RAIZ, n, ".git")))
+
+
+def _tail(caminho, limite=262144):
+    """Só o fim do arquivo: transcripts passam de megabytes e isto roda a cada leitura.
+
+    Falha aberta: transcript pode sumir entre o exists() de quem chama e este
+    open() (/clear, rotação, escritor concorrente), ou dar erro de permissão —
+    qualquer OSError vira lista vazia, nunca propaga.
+    """
+    try:
+        with open(caminho, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            tam = f.tell()
+            f.seek(max(0, tam - limite))
+            bruto = f.read()
+    except OSError:
+        return []
+    linhas = bruto.decode("utf-8", "replace").splitlines()
+    return linhas[1:] if tam > limite and linhas else linhas   # descarta a 1ª, cortada ao meio
+
+
+def _eventos(transcript, limite=262144):
+    """Eventos do transcript, do mais recente pro mais antigo.
+
+    Único lugar que os dois usos (projeto_da_sessao, ultimo_pedido) tocam o
+    transcript — a guarda de I/O de _tail vale pros dois de uma vez, não há
+    como corrigir um caminho e esquecer o outro.
+    """
+    if not transcript:
+        return
+    for linha in reversed(_tail(transcript, limite)):
+        try:
+            e = json.loads(linha)
+        except Exception:
+            continue
+        if isinstance(e, dict):        # linha pode ser número/string/lista — formato interno, não contrato
+            yield e
+
+
+def _caminhos_bash(comando):
+    """Só o que o comando TOCA, não tudo que ele menciona: `git -C <repo>` e `cd <repo>`."""
+    return re.findall(r'git\s+-C\s+(\S+)', comando) + re.findall(r'(?:^|[;&|]\s*)cd\s+(\S+)', comando)
+
+
+def _slug_no_evento(e, validos):
+    conteudo = (e.get("message") or {}).get("content")
+    if not isinstance(conteudo, list):
+        return None
+    for bloco in conteudo:
+        if not isinstance(bloco, dict) or bloco.get("type") != "tool_use":
+            continue
+        nome = bloco.get("name")
+        entrada = bloco.get("input") or {}
+        if nome in ("Edit", "Write", "NotebookEdit"):
+            alvo = " ".join(str(entrada.get(k, "")) for k in CAMPOS_ARQUIVO)
+        elif nome == "Bash":
+            alvo = " ".join(_caminhos_bash(str(entrada.get("command", ""))))
+        else:
+            continue                   # ler/citar não é reivindicar — só escrita conta
+        for slug in validos:
+            if re.search(r'(^|[/\s"\'])' + re.escape(slug) + r'([/\s"\']|$)', alvo):
+                return slug
+    return None
+
+
+def _sob_a_raiz(caminho, validos):
+    """O projeto da raiz que contém `caminho`, ou None."""
+    if not caminho:
+        return None
+    rel = os.path.relpath(caminho, RAIZ)
+    if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+        return None
+    topo = rel.split(os.sep)[0]
+    return topo if topo in validos else None
+
+
+def _projeto_do_cwd(cwd, validos):
+    """Projeto a que o diretório de trabalho pertence, ou None.
+
+    Resolve o WORKTREE também, e é o caso que mais importa: `proj-wt/ramo` não
+    mora sob a raiz, mas seu `--git-common-dir` aponta para `raiz/proj/.git` — o
+    repositório é quem diz de quem o diretório é. Sem isto, toda aba em worktree cai
+    na varredura do transcript, que é justamente o palpite que erra.
+    """
+    direto = _sob_a_raiz(cwd, validos)
+    if direto:
+        return direto                  # caso comum: nem paga o subprocesso
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    try:
+        saida = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None                    # git ausente ou travado nunca derruba o painel
+    if saida.returncode != 0:
+        return None
+    comum = saida.stdout.strip()
+    if not comum:
+        return None
+    if not os.path.isabs(comum):
+        comum = os.path.join(cwd, comum)
+    return _sob_a_raiz(os.path.dirname(os.path.abspath(comum)), validos)
+
+
+def projeto_da_sessao(transcript, cwd, validos):
+    # O cwd manda quando ELE MESMO é um projeto (ou worktree de um): isso é fato, não
+    # pista. A varredura do transcript entra só depois, para a aba aberta NA RAIZ, onde
+    # o cwd não distingue projeto nenhum.
+    #
+    # A ordem era a inversa, e custava caro: `_slug_no_evento` conta todo `Bash` como
+    # reivindicação, mesmo o de leitura pura, contra o que o comentário dele mesmo
+    # promete ("só escrita conta"). Um `git -C .../outro-projeto status` rebatizava a
+    # aba inteira — rótulo confiante e falso, que é pior que o "—" honesto.
+    do_cwd = _projeto_do_cwd(cwd, validos)
+    if do_cwd:
+        return do_cwd
+    for e in _eventos(transcript):
+        slug = _slug_no_evento(e, validos)
+        if slug:
+            return slug
+    return "—"      # aba nova é legitimamente indefinida; palpite é pior que admitir
+
+
+# Chega como "user" no transcript sem ser o dono: marcação do harness, interrupção
+# e mensagem de outra sessão (SendMessage).
+NAO_E_PEDIDO = ("<", "[Request interrupted", "Another Claude session sent a message")
+
+
+def ultimo_pedido(transcript, limite=90):
+    for e in _eventos(transcript):
+        if e.get("type") != "user":
+            continue
+        txt = (e.get("message") or {}).get("content")
+        if not isinstance(txt, str):
+            continue                       # lista = tool_result, não é pedido do dono
+        txt = txt.strip()
+        if not txt or txt.startswith(NAO_E_PEDIDO):
+            continue
+        return txt.splitlines()[0][:limite]
+    return ""
+
+
+IGNORAR_CMD = ("/bin/zsh", "/bin/bash", "-zsh", "ps -Ao", "/abas", "caffeinate")
+
+# A ferramenta Bash roda cada comando sob um shell que carrega o snapshot; o que nasce
+# direto do claude (servidor MCP, caffeinate) vive a sessão inteira e não é trabalho.
+MARCA_BASH = "shell-snapshots/snapshot-"
+
+_INTERPRETE = re.compile(r'^\S*/(python[0-9.]*|Python|node|ruby)\b', re.IGNORECASE)
+
+
+def _arvore_ps(saida_ps):
+    """`pid=,ppid=,command=` do ps já parseado num mapa ppid -> [(pid, comando), ...]."""
+    filhos = {}
+    for linha in (saida_ps or "").splitlines():
+        partes = linha.split(None, 2)
+        if len(partes) < 3:
+            continue
+        try:
+            p, pp = int(partes[0]), int(partes[1])
+        except ValueError:
+            continue
+        filhos.setdefault(pp, []).append((p, partes[2]))
+    return filhos
+
+
+def comando_em_execucao(pid, limite=70, arvore=None):
+    """Descendente do processo claude que representa trabalho de verdade.
+
+    `arvore` pré-parseada é o gancho de teste: sem ela, sai a `ps` de verdade.
+    """
+    if arvore is None:
+        try:
+            r = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="],
+                               capture_output=True, text=True, timeout=5)
+        except Exception:
+            return None
+        arvore = _arvore_ps(r.stdout)
+    fila = [p for p, cmd in arvore.get(pid, []) if MARCA_BASH in cmd]
+    vistos, candidatos = set(), []
+    while fila:
+        atual = fila.pop(0)
+        if atual in vistos:
+            continue
+        vistos.add(atual)
+        for p, cmd in arvore.get(atual, []):
+            fila.append(p)
+            if any(marca in cmd for marca in IGNORAR_CMD):
+                continue        # wrapper de shell e o próprio painel não são trabalho
+            candidatos.append(cmd)
+    if not candidatos:
+        return None
+    cmd = candidatos[-1].strip()
+    cmd = _INTERPRETE.sub(lambda m: m.group(1), cmd)   # caminho de framework não pode comer o dado que importa
+    return cmd[:limite] + ("…" if len(cmd) > limite else "")
+
+
+def _git(dir_repo, args):
+    try:
+        r = subprocess.run(["git", "--no-optional-locks", "-C", dir_repo] + args,
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip()
+
+
+def estado_repos(validos):
+    saida = []
+    for slug in validos:
+        d = os.path.join(RAIZ, slug)
+        branch = _git(d, ["rev-parse", "--abbrev-ref", "HEAD"]) or "—"
+        st = _git(d, ["status", "--porcelain"])
+        sujos = len([l for l in (st or "").splitlines() if l.strip()])
+        ahead = behind = 0
+        contagem = _git(d, ["rev-list", "--count", "--left-right", "@{u}...HEAD"])
+        if contagem:                       # None quando não há upstream ou não há commit
+            partes = contagem.split()
+            if len(partes) == 2:
+                try:
+                    behind, ahead = int(partes[0]), int(partes[1])
+                except ValueError:
+                    pass
+        wt = _git(d, ["worktree", "list"]) or ""
+        saida.append({"slug": slug, "branch": branch, "sujos": sujos, "ahead": ahead,
+                      "behind": behind,
+                      "worktrees": len([l for l in wt.splitlines() if l.strip()])})
+    return saida
+
+
+def alertas(abas, repos):
+    avisos = []
+    donos = {}
+    sem_projeto = 0
+    for a in abas:
+        p = a.get("projeto")
+        if p and p != "—":
+            donos.setdefault(p, []).append(a)
+        else:
+            sem_projeto += 1
+    for r in repos:
+        if r["sujos"] > 0 and r["slug"] not in donos:
+            avisos.append("%s está sujo (%d arquivo(s)) e nenhuma aba viva o reivindica — "
+                          "trabalho órfão, não comitar por cima" % (r["slug"], r["sujos"]))
+    for slug, lista in sorted(donos.items()):
+        if len(lista) > 1:
+            avisos.append("%d abas no mesmo projeto (%s): pids %s — uma delas devia estar em worktree"
+                          % (len(lista), slug, ", ".join(str(a["pid"]) for a in lista)))
+    if sem_projeto:
+        avisos.insert(0, "%d aba(s) sem projeto identificado — os alertas abaixo não as consideram"
+                      % sem_projeto)
+    return avisos
+
+
+def idade(iso):
+    if not iso:
+        return "?"
+    try:
+        t = datetime.fromisoformat(iso)
+    except Exception:
+        return "?"
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    seg = int((datetime.now(timezone.utc) - t).total_seconds())
+    if seg < 60:
+        return "%ds" % max(seg, 0)
+    if seg < 3600:
+        return "%dmin" % (seg // 60)
+    return "%dh" % (seg // 3600)
+
+
+def ativo_ha(transcript):
+    """Segundos desde a última escrita no transcript, ou None (sem transcript, sumido)."""
+    if not transcript:
+        return None
+    try:
+        return max(0, int(time.time() - os.path.getmtime(transcript)))
+    except OSError:
+        return None
+
+
+TRABALHANDO_S = 60      # escreveu no transcript há menos que isto = está no meio de um turno
+
+
+def rotulo(aba):
+    if aba.get("apelido"):
+        return aba["apelido"]
+    proj = aba.get("projeto")
+    if proj and proj != "—":
+        return proj
+    sid = aba.get("session_id")
+    return sid[:8] if sid else "pid %s" % aba.get("pid")
+
+
+def linha_inventario(outras, teto=5):
+    if not outras:
+        return ""                          # sozinho: silêncio, custo zero
+    ordenadas = sorted(outras, key=lambda a: a.get("inicio") or "", reverse=True)
+    partes = ["%s (%s)" % (rotulo(a), idade(a.get("inicio"))) for a in ordenadas[:teto]]
+    extra = len(ordenadas) - len(partes)
+    if extra > 0:
+        partes.append("+%d" % extra)
+    return "Outras abas vivas: " + ", ".join(partes) + "."
+
+
+def cmd_hook_start():
+    try:
+        dados = json.load(sys.stdin)
+    except Exception:
+        return
+    sid = dados.get("session_id")
+    if not sid:
+        return
+    pid = pid_do_claude()
+    limpar_pid(pid)
+    escrever({
+        "session_id": sid,
+        "pid": pid,
+        "cwd": dados.get("cwd") or "",
+        "transcript": dados.get("transcript_path") or "",
+        "inicio": agora(),
+        "apelido": None,
+    })
+    validos = projetos_validos()
+    outras = []
+    for a in abas_vivas():
+        if a.get("session_id") == sid:
+            continue
+        a["projeto"] = projeto_da_sessao(a.get("transcript"), a.get("cwd"), validos)
+        outras.append(a)
+    linha = linha_inventario(outras)
+    if linha:
+        sys.stdout.write("[contexto de fundo — não comentar sem ser perguntado] " + linha + "\n")
+
+
+def cmd_hook_end():
+    try:
+        dados = json.load(sys.stdin)
+    except Exception:
+        return
+    sid = dados.get("session_id")
+    if not sid:
+        return
+    try:
+        os.remove(os.path.join(REG, "%s.json" % sid))
+    except OSError:
+        pass
+    trinco_soltar(pid_do_claude())          # aba que fecha no meio do /fim não trava as outras
+
+
+def coletar():
+    validos = projetos_validos()
+    abas = abas_vivas()
+    for a in abas:
+        a["projeto"] = projeto_da_sessao(a.get("transcript"), a.get("cwd"), validos)
+        a["fazendo"] = comando_em_execucao(a["pid"])
+        a["pedido"] = ultimo_pedido(a.get("transcript"))
+        a["ativo_ha_s"] = ativo_ha(a.get("transcript"))
+    return abas, estado_repos(validos)
+
+
+def montar_json(abas, repos):
+    """O painel em JSON (`abas json`), para quem quiser desenhá-lo em outro lugar."""
+    saida = []
+    for a in abas:
+        ativo = a.get("ativo_ha_s")
+        saida.append({
+            "pid": a["pid"], "session_id": a.get("session_id"), "rotulo": rotulo(a),
+            "projeto": a.get("projeto"), "idade": idade(a.get("inicio")),
+            "fazendo": a.get("fazendo"), "pedido": a.get("pedido"), "ativo_ha_s": ativo,
+            "trabalhando": bool(a.get("fazendo")) or (ativo is not None and ativo < TRABALHANDO_S),
+            "registrada": a.get("registrada", False),
+        })
+    return {"gerado": agora(), "abas": saida, "repos": repos, "alertas": alertas(abas, repos)}
+
+
+def cmd_json():
+    abas, repos = coletar()
+    json.dump(montar_json(abas, repos), sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_painel():
+    abas, repos = coletar()
+    print("ABAS VIVAS (%d)" % len(abas))
+    if not abas:
+        print("  nenhuma")
+    for a in abas:
+        marca = "" if a["registrada"] else "  [não registrada — reinicie para nomear]"
+        atividade = ("▶ " + a["fazendo"]) if a["fazendo"] else ("(ocioso) " + (a["pedido"] or "—"))
+        print("  %-7s %-24s %-18s %-5s %s%s" % (
+            a["pid"], rotulo(a)[:24], a["projeto"][:18], idade(a.get("inicio")),
+            atividade, marca))
+    t = trinco_ler()
+    if t is not None and trinco_valido(t):
+        print("\nTRINCO  com a aba %s (pid %s, há %s, motivo: %s)" % (
+            t.get("session_id") or "?", t.get("pid"), idade(t.get("inicio")), t.get("motivo") or "?"))
+    print("\nREPOS")
+    for r in repos:
+        print("  %-20s %-12s sujo:%-3d ahead:%-3d behind:%-3d wt:%d" % (
+            r["slug"], r["branch"][:12], r["sujos"], r["ahead"], r["behind"], r["worktrees"]))
+    avisos = alertas(abas, repos)
+    print("\nALERTAS")
+    if not avisos:
+        print("  nenhum")
+    for a in avisos:
+        print("  ! " + a)
+
+
+def cmd_nome(sid, apelido):
+    caminho = os.path.join(REG, "%s.json" % sid)
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        sys.stderr.write("sem registro para a sessão %s\n" % sid)
+        return 1
+    rec["apelido"] = apelido
+    escrever(rec)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Trinco: exclusividade sobre a camada OS da raiz (/fim, merge/pull/checkout na raiz).
+# Um arquivo em .claude/abas/ com o pid do claude dono. Pid morto = trinco vazio, então
+# aba que fecha sem soltar não trava ninguém. Pegar com --espera serializa os /fim sem
+# ninguém perguntar a ninguém.
+# ---------------------------------------------------------------------------
+
+TRINCO_SEM_PID_S = 15 * 60       # trinco sem pid identificável vale isto, depois é lixo
+
+
+def trinco_caminho():
+    return os.path.join(REG, "trinco.json")
+
+
+def trinco_ler():
+    try:
+        with open(trinco_caminho(), encoding="utf-8") as f:
+            t = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return t if isinstance(t, dict) else None
+
+
+class _trinco_mutex:
+    """flock num arquivo que nunca é apagado: serializa ler/decidir/criar entre abas."""
+    def __enter__(self):
+        os.makedirs(REG, exist_ok=True)
+        self.fd = os.open(os.path.join(REG, "trinco.flock"), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+        return False
+
+
+def trinco_escrever(rec):
+    os.makedirs(REG, exist_ok=True)
+    with open(trinco_caminho(), "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+
+
+def trinco_valido(t):
+    pid = t.get("pid")
+    if isinstance(pid, int):
+        return vivo(pid)
+    try:
+        inicio = datetime.fromisoformat(t.get("inicio") or "")
+    except Exception:
+        return False
+    if inicio.tzinfo is None:
+        inicio = inicio.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - inicio).total_seconds() < TRINCO_SEM_PID_S
+
+
+def _trinco_criar(rec):
+    """Criação atômica: O_EXCL perde a corrida para quem chegou antes, nunca sobrescreve."""
+    os.makedirs(REG, exist_ok=True)
+    try:
+        fd = os.open(trinco_caminho(), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    return True
+
+
+def trinco_pegar(pid, sid, espera=90, motivo=""):
+    """0 = trinco meu (novo, renovado ou tomado de dono morto); 1 = outra aba viva o segura."""
+    fim = time.time() + max(0, espera)
+    while True:
+        with _trinco_mutex():
+            t = trinco_ler()
+            if t is not None and t.get("pid") == pid and isinstance(pid, int):
+                return 0                               # já é meu: idempotente
+            if t is None or not trinco_valido(t):
+                if t is not None:
+                    try:
+                        os.remove(trinco_caminho())   # dono morto: lixo
+                    except OSError:
+                        pass
+                if _trinco_criar({"pid": pid, "session_id": sid, "inicio": agora(), "motivo": motivo}):
+                    return 0
+                continue                               # perdeu a corrida: reler
+        restante = fim - time.time()
+        if restante <= 0:
+            sys.stderr.write("trinco ocupado pela aba %s (pid %s, há %s, motivo: %s)\n" % (
+                t.get("session_id") or "?", t.get("pid"), idade(t.get("inicio")), t.get("motivo") or "?"))
+            return 1
+        time.sleep(min(2.0, restante))
+
+
+def trinco_soltar(pid):
+    """0 = solto (ou já estava); 1 = é de outra aba viva, não solta."""
+    with _trinco_mutex():
+        t = trinco_ler()
+        if t is None:
+            return 0
+        if t.get("pid") == pid or not trinco_valido(t):
+            try:
+                os.remove(trinco_caminho())
+            except OSError:
+                pass
+            return 0
+    sys.stderr.write("trinco é da aba %s (pid %s): não solto\n" % (t.get("session_id") or "?", t.get("pid")))
+    return 1
+
+
+def cmd_trinco(argv):
+    pid = pid_do_claude()
+    sid = next((r.get("session_id") for r in ler() if r.get("pid") == pid), None) or "?"
+    sub = argv[0] if argv else ""
+    if sub == "pegar":
+        espera, motivo = 90, ""
+        i = 1
+        while i < len(argv):
+            if argv[i] == "--espera" and i + 1 < len(argv):
+                try:
+                    espera = int(argv[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif argv[i] == "--motivo" and i + 1 < len(argv):
+                motivo = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        rc = trinco_pegar(pid, sid, espera=espera, motivo=motivo)
+        if rc == 0:
+            print("trinco pego (pid %s, sessão %s)" % (pid, sid[:8]))
+        return rc
+    if sub == "soltar":
+        rc = trinco_soltar(pid)
+        if rc == 0:
+            print("trinco solto")
+        return rc
+    t = trinco_ler()
+    if t is None or not trinco_valido(t):
+        print("trinco livre")
+    else:
+        print("trinco com a aba %s (pid %s, há %s, motivo: %s)%s" % (
+            t.get("session_id") or "?", t.get("pid"), idade(t.get("inicio")), t.get("motivo") or "?",
+            " — é desta aba" if t.get("pid") == pid else ""))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Portão: hook PreToolUse(Bash). Intercepta git que MUDA working tree ou HEAD e nega só
+# quando o checkout alvo é de outra aba viva — ou é a raiz e esta aba não tem o trinco.
+# push fica fora: não toca working tree nenhuma. Falha aberta: qualquer erro = silêncio.
+# ---------------------------------------------------------------------------
+
+GIT_MUTAVEIS = {"checkout", "switch", "merge", "pull", "rebase", "reset", "restore", "stash",
+                "cherry-pick", "revert", "clean", "am", "apply"}
+GIT_OPCAO_COM_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+                     "--super-prefix", "--config-env"}
+_SEPARADORES = {";", "&&", "||", "|", "&", "|&"}
+_SEPARADOR_CHARS = set(";&|\n()")
+_PONTUACAO = set("();<>|&\n")                       # qualquer token só disto é fronteira de segmento
+_PALAVRAS_SHELL = {"then", "do", "else", "elif", "if", "while", "until", "!", "{", "}",
+                   "time", "env", "command", "nohup", "exec", "builtin"}
+_ATRIBUICAO = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _tokens_shell(comando):
+    # heredoc: o corpo não é comando; tudo depois do primeiro << fica fora (falha aberta)
+    corte = re.search(r"<<-?\s*['\"]?\w", comando)
+    if corte:
+        comando = comando[:corte.start()]
+    try:
+        lex = shlex.shlex(comando, posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace_split = True
+        lex.whitespace = " \t\r"                      # \n é separador, não espaço
+        lex.commenters = ""                            # '#' não pode engolir a linha seguinte
+        return list(lex)
+    except ValueError:                                 # aspa sem par: separa por linha e ;&| mesmo assim
+        saida = []
+        for pedaco in re.split(r"([;&|\n()]+)", comando):
+            saida.extend([pedaco] if pedaco and set(pedaco) <= _PONTUACAO
+                         else [t.strip("\"'") for t in pedaco.split()])
+        return saida
+
+
+def _segmentos(tokens):
+    seg, saida = [], []
+    for tok in tokens:
+        if tok and set(tok) <= _PONTUACAO:
+            if seg:
+                saida.append(seg)
+            seg = []
+            saida.extend([c] for c in tok if c in "()")   # subshell: alvos_git empilha o cwd
+        else:
+            seg.append(tok)
+    if seg:
+        saida.append(seg)
+    return saida
+
+
+def alvos_git(comando, cwd):
+    """[(subcomando, diretório do checkout alvo)] só para git que muda working tree/HEAD."""
+    atual = cwd
+    saida, pilha, vistos, desbalanceado = [], [], [cwd], False
+    for seg in _segmentos(_tokens_shell(comando or "")):
+        if seg == ["("]:
+            pilha.append(atual)
+            continue
+        if seg == [")"]:                                 # ')' entre aspas ou de `case` vira ')' aqui também
+            if pilha:
+                atual = pilha.pop()
+            else:
+                desbalanceado = True
+            continue
+        while seg and (_ATRIBUICAO.match(seg[0]) or seg[0] in _PALAVRAS_SHELL):
+            seg = seg[1:]
+        if not seg:
+            continue
+        if seg[0] == "cd":
+            if len(seg) > 1 and not seg[1].startswith("-"):
+                atual = os.path.normpath(os.path.join(atual, os.path.expanduser(seg[1])))
+                vistos.append(atual)
+            continue
+        if os.path.basename(seg[0]) != "git":
+            continue
+        alvo, i = atual, 1
+        while i < len(seg) and seg[i].startswith("-"):
+            tok = seg[i]
+            if tok in GIT_OPCAO_COM_ARG:
+                if tok == "-C" and i + 1 < len(seg):
+                    alvo = os.path.normpath(os.path.join(alvo, os.path.expanduser(seg[i + 1])))
+                i += 2
+            elif tok.startswith("-C") and len(tok) > 2:
+                alvo = os.path.normpath(os.path.join(alvo, os.path.expanduser(tok[2:])))
+                i += 1
+            else:
+                i += 1
+        if i >= len(seg):
+            continue
+        sub = seg[i]
+        if sub not in GIT_MUTAVEIS:
+            continue
+        if sub == "stash" and i + 1 < len(seg) and seg[i + 1] in ("list", "show"):
+            continue
+        saida.append((sub, alvo))
+    if (desbalanceado or pilha) and saida:               # pilha não fechou: o diretório é incerto, fecha para todos
+        for sub, _ in list(saida):
+            saida.extend((sub, d) for d in vistos if (sub, d) not in saida)
+    return saida
+
+
+def topo_do_checkout(caminho):
+    """Diretório do checkout (worktree) que contém `caminho`: sobe até achar um `.git`."""
+    if not caminho:
+        return None
+    d = os.path.realpath(caminho)
+    if os.path.isfile(d):
+        d = os.path.dirname(d)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        pai = os.path.dirname(d)
+        if pai == d:
+            return None
+        d = pai
+
+
+def repo_principal(topo):
+    """Checkout principal do repo a que `topo` pertence (worktree aponta para quem o criou)."""
+    g = os.path.join(topo, ".git")
+    if not os.path.isfile(g):
+        return topo
+    try:
+        with open(g, encoding="utf-8") as f:
+            linha = f.readline().strip()
+    except OSError:
+        return topo
+    if not linha.startswith("gitdir:"):
+        return topo
+    gitdir = linha[len("gitdir:"):].strip()
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(topo, gitdir)
+    gitdir = os.path.normpath(gitdir)
+    if os.path.basename(os.path.dirname(gitdir)) != "worktrees":
+        return topo
+    return os.path.dirname(os.path.dirname(os.path.dirname(gitdir)))
+
+
+def _caminhos_escritos(e, cwd):
+    """Caminhos que o evento ESCREVE ou onde a shell PASSOU a trabalhar — ler não reivindica."""
+    conteudo = (e.get("message") or {}).get("content")
+    if not isinstance(conteudo, list):
+        return
+    for bloco in conteudo:
+        if not isinstance(bloco, dict) or bloco.get("type") != "tool_use":
+            continue
+        nome, entrada = bloco.get("name"), bloco.get("input") or {}
+        if nome in ("Edit", "Write", "NotebookEdit"):
+            for k in CAMPOS_ARQUIVO:
+                if entrada.get(k):
+                    yield str(entrada[k])
+        elif nome == "Bash":
+            cmd = str(entrada.get("command", ""))
+            for _sub, d in alvos_git(cmd, cwd):
+                yield d
+            for d in re.findall(r"(?:^|[;&|]\s*)cd\s+(\S+)", cmd):
+                yield os.path.normpath(os.path.join(cwd, os.path.expanduser(d.strip("\"'"))))
+
+
+def checkout_da_aba(rec, raiz):
+    """Checkout que a aba segura: o do cwd se for projeto; senão o último caminho escrito
+    no transcript fora da raiz; senão a própria raiz."""
+    cwd = rec.get("cwd") or raiz
+    topo = topo_do_checkout(cwd)
+    if topo and topo != raiz:
+        return topo
+    for e in _eventos(rec.get("transcript")):
+        for caminho in _caminhos_escritos(e, cwd):
+            t = topo_do_checkout(caminho)
+            if t and t != raiz:
+                return t
+    return topo
+
+
+def decidir_portao(alvos, abas, meu_pid, minha_sid, raiz, trinco=None):
+    """None = passa; string = motivo da negação."""
+    def minha(a):
+        return (isinstance(meu_pid, int) and a.get("pid") == meu_pid) or \
+               (minha_sid and a.get("session_id") == minha_sid)
+    outras = [a for a in abas if not minha(a)]
+    if not outras:
+        return None
+    for sub, d in alvos:
+        topo = topo_do_checkout(d)
+        if topo is None:
+            continue                                   # não é repo: o git mesmo recusa
+        if topo == raiz:
+            if trinco and isinstance(meu_pid, int) and trinco.get("pid") == meu_pid:
+                continue
+            return ("portão de abas: `git %s` na raiz com %d outra(s) aba(s) viva(s) exige o trinco "
+                    "da camada OS. Rode `.claude/bin/abas trinco pegar --motivo <por quê>` antes "
+                    "(espera a vez sozinho) e `.claude/bin/abas trinco soltar` depois." % (sub, len(outras)))
+        donos = [a for a in outras if a.get("checkout") == topo]
+        if donos:
+            a = donos[0]
+            return ("portão de abas: `git %s` em %s tocaria o checkout que a aba %s (pid %s, %s) segura. "
+                    "Checkout alheio nunca se troca: trabalhe num worktree próprio (`git worktree add`) "
+                    "ou espere a aba fechar — brain/notas/protocolo-de-abas.md." % (
+                        sub, topo, rotulo(a), a.get("pid"), idade(a.get("inicio"))))
+    return None
+
+
+# Portão de escrita: Write (reescrita do arquivo inteiro) em arquivo COMPARTILHADO da camada
+# OS, com outra aba viva. É o único modo de PERDER conteúdo entre abas: Write a partir de
+# leitura velha apaga o que a outra acabou de gravar. Edit relê na hora e não tem esse
+# defeito; arquivo que ainda não existe é criação legítima; o trinco dá o direito exclusivo.
+ESCRITA_COMPARTILHADA = ("STATUS.md", "CLAUDE.md", "brain/memoria/MEMORY.md")
+ESCRITA_COMPARTILHADA_PREFIXOS = ("brain/notas/",)
+
+
+def decidir_escrita(caminho, abas, meu_pid, raiz, trinco=None):
+    """None = passa; string = motivo da negação."""
+    outras = [a for a in abas if not (isinstance(meu_pid, int) and a.get("pid") == meu_pid)]
+    if not outras or not caminho:
+        return None
+    raiz = os.path.realpath(raiz)
+    rel = os.path.relpath(os.path.realpath(caminho), raiz)    # symlink (o da memória) não disfarça
+    if rel.startswith(".." + os.sep) or rel == "..":
+        return None
+    dobra = str.lower if sys.platform == "darwin" else str   # APFS ignora caixa
+    if dobra(rel) not in map(dobra, ESCRITA_COMPARTILHADA) and \
+            not dobra(rel).startswith(tuple(map(dobra, ESCRITA_COMPARTILHADA_PREFIXOS))):
+        return None
+    if not os.path.exists(os.path.join(raiz, rel)):
+        return None                                    # criar arquivo novo não apaga ninguém
+    if trinco and isinstance(meu_pid, int) and trinco.get("pid") == meu_pid:
+        return None
+    return ("portão de abas: Write reescreveria %s inteiro com %d outra(s) aba(s) viva(s) — a partir de "
+            "uma leitura velha, apagaria o que ela gravou. Use Edit (troca de trecho, relê na hora). "
+            "Se for mesmo reescrever tudo: `.claude/bin/abas trinco pegar --motivo <por quê>`, releia, "
+            "escreva, `abas trinco soltar`." % (rel, len(outras)))
+
+
+def _negar(motivo):
+    json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                      "permissionDecision": "deny",
+                                      "permissionDecisionReason": motivo}}, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_portao():
+    dados = json.load(sys.stdin)
+    entrada = dados.get("tool_input") or {}
+    cwd = dados.get("cwd") or RAIZ
+    if dados.get("tool_name") == "Write":
+        caminho = str(entrada.get("file_path") or "")
+        if caminho and not os.path.isabs(caminho):
+            caminho = os.path.join(cwd, caminho)
+        motivo = decidir_escrita(caminho, ler(), pid_do_claude(), RAIZ, trinco=trinco_ler())
+        if motivo:
+            _negar(motivo)
+        return
+    comando = str(entrada.get("command") or "")
+    alvos = alvos_git(comando, cwd)
+    if not alvos:
+        return
+    meu_pid = pid_do_claude()
+    minha_sid = dados.get("session_id")
+    abas = ler()
+    for a in abas:
+        if a.get("pid") != meu_pid and a.get("session_id") != minha_sid:
+            a["checkout"] = checkout_da_aba(a, RAIZ)
+    motivo = decidir_portao(alvos, abas, meu_pid, minha_sid, RAIZ, trinco=trinco_ler())
+    if motivo:
+        _negar(motivo)
+
+
+def _selftest_trinco_e_portao():
+    """Trinco (lock do /fim) e portão (hook PreToolUse de git). Chamado pelo modo_selftest."""
+    n = 0
+    def ok(cond, msg):
+        nonlocal n
+        assert cond, msg
+        n += 1
+
+    # --- trinco -------------------------------------------------------------
+    meu, morto, outro_vivo = os.getpid(), 2147483647, 1   # launchd está sempre vivo e nunca é nosso
+    ok(trinco_ler() is None, "sem arquivo, trinco vazio")
+    ok(trinco_pegar(meu, "s1", espera=0, motivo="fim") == 0, "pegar com trinco vazio")
+    ok(not any(r.get("session_id") == "s1" for r in ler()), "trinco.json não aparece como aba")
+    t = trinco_ler()
+    ok(t and t["pid"] == meu and t["motivo"] == "fim", "trinco gravou pid e motivo: %r" % (t,))
+    ok(trinco_pegar(meu, "s1", espera=0) == 0, "pegar de novo com o próprio pid é idempotente")
+    ok(trinco_pegar(outro_vivo, "s2", espera=0) == 1, "outro pid vivo não pega trinco ocupado")
+    ok(trinco_ler()["pid"] == meu, "tentativa alheia não altera o dono")
+    ok(trinco_soltar(outro_vivo) == 1, "outro pid vivo não solta trinco alheio")
+    ok(trinco_ler() is not None, "soltar alheio não remove")
+    ok(trinco_soltar(meu) == 0, "dono solta")
+    ok(trinco_ler() is None, "soltou de verdade")
+    ok(trinco_soltar(meu) == 0, "soltar sem trinco é idempotente")
+    # dono morto = trinco vazio
+    trinco_escrever({"pid": morto, "session_id": "sx", "inicio": agora(), "motivo": "fim"})
+    ok(trinco_pegar(meu, "s1", espera=0) == 0, "pid morto no trinco é trinco vazio")
+    ok(trinco_ler()["pid"] == meu, "tomou do morto")
+    ok(trinco_soltar(meu) == 0, "limpa")
+    # trinco sem pid: ler() (que poda registro sem pid vivo) não pode apagá-lo
+    trinco_escrever({"pid": None, "session_id": "sx", "inicio": agora(), "motivo": "fim"})
+    ler()
+    ok(trinco_ler() is not None, "ler() não poda o trinco sem pid")
+    ok(trinco_pegar(meu, "s1", espera=0) == 1, "trinco sem pid recente segura")
+    os.remove(trinco_caminho())
+    # espera: dono vivo que não solta -> timeout, exit 1, sem laçar
+    trinco_escrever({"pid": outro_vivo, "session_id": "s2", "inicio": agora(), "motivo": "fim"})
+    t0 = time.time()
+    ok(trinco_pegar(meu, "s1", espera=1) == 1, "espera estoura e devolve 1")
+    ok(time.time() - t0 < 5, "espera de 1 s não pode demorar 5")
+    ok(trinco_soltar(meu) == 1 and trinco_ler()["pid"] == outro_vivo, "ainda do outro")
+    os.remove(trinco_caminho())
+
+    # --- portão: parse do comando ---------------------------------------------
+    alvos = lambda cmd, cwd="/w/raiz": alvos_git(cmd, cwd)
+    ok(alvos("git status") == [], "status não é mutação")
+    ok(alvos("git push origin main") == [], "push não toca working tree: fora do portão")
+    ok(alvos("git commit --only -m x -- STATUS.md") == [], "commit fica fora")
+    ok(alvos("git log --oneline") == [], "log fora")
+    ok(alvos("cd /w/raiz/x\ngit merge a") == [("merge", "/w/raiz/x")], "quebra de linha separa comandos")
+    ok(alvos("ls # x\ngit reset --hard") == [("reset", "/w/raiz")], "comentário não engole a linha seguinte")
+    ok(alvos('git commit -m "a\nb" -- x') == [], "quebra de linha entre aspas não separa")
+    ok(alvos("for d in a; do git pull; done") == [("pull", "/w/raiz")], "do/then não escondem o git")
+    ok(alvos("if true; then git merge x; fi") == [("merge", "/w/raiz")], "then não esconde o git")
+    ok(alvos("env GIT_X=1 git merge x") == [("merge", "/w/raiz")], "env e atribuição não escondem o git")
+    ok(alvos("x=$(git rev-parse HEAD)\ngit merge y") == [("merge", "/w/raiz")], "')\\n' colado é separador")
+    ok(alvos("(cd a)\ngit merge y") == [("merge", "/w/raiz")], "cd em subshell não persiste")
+    ok(alvos("(cd a && git merge y)") == [("merge", "/w/raiz/a")], "dentro do subshell o cd vale")
+    ok(alvos("cat <(git merge y)") == [("merge", "/w/raiz")], "substituição de processo é subshell")
+    ok(alvos("(cd /tmp)>/dev/null\ngit merge y") == [("merge", "/w/raiz")], "')>' colado fecha o subshell")
+    ok(alvos("git merge x 2>/dev/null") == [("merge", "/w/raiz")], "redirecionamento não esconde")
+    ok(alvos('cd "/w/raiz/x" && git merge y; echo "a') == [("merge", "/w/raiz/x")], "fallback sem aspas no alvo")
+    ok(("merge", "/w/raiz") in alvos("case x in a) git merge y;; esac"), "case desbalanceia: avalia na raiz")
+    a = alvos('(cd a && echo ")" && git merge y)')
+    ok(("merge", "/w/raiz/a") in a and ("merge", "/w/raiz") in a, "parêntese entre aspas: fecha para os dois lados %r" % a)
+    ok(alvos("cd /w/raiz/x && echo \"aberta\ngit merge y") == [("merge", "/w/raiz/x")], "aspa sem par: ainda separa por linha")
+    ok(alvos("git merge feat") == [("merge", "/w/raiz")], "merge no cwd: %r" % alvos("git merge feat"))
+    ok(alvos("git -C /w/raiz/proj pull") == [("pull", "/w/raiz/proj")], "-C manda")
+    ok(alvos("git -C proj checkout main", "/w/raiz") == [("checkout", "/w/raiz/proj")], "-C relativo ao cwd")
+    ok(alvos("cd /w/raiz/proj && git switch main") == [("switch", "/w/raiz/proj")], "cd antes do git")
+    ok(alvos("cd /w/raiz/proj && git status && git rebase main") == [("rebase", "/w/raiz/proj")], "só o mutável")
+    ok(alvos("git stash list") == [], "stash list é leitura")
+    ok(alvos("git stash pop") == [("stash", "/w/raiz")], "stash pop é mutação")
+    ok(alvos("git stash") == [("stash", "/w/raiz")], "stash (push) também: reverte arquivos de todo mundo")
+    ok(alvos("git --no-pager -c core.quotepath=off reset --hard HEAD") == [("reset", "/w/raiz")], "opções globais pulam")
+    ok(alvos("git checkout main -- app.py") == [("checkout", "/w/raiz")], "checkout de path também")
+    ok(alvos("git worktree list") == [], "worktree list fora")
+    ok(alvos("git merge-tree --write-tree a b") == [], "merge-tree é a seco: fora")
+    ok(alvos("GIT_DIR=x git merge a") == [("merge", "/w/raiz")], "VAR=valor no início não engana")
+    ok(alvos("echo 'git merge' ; ls") == [], "string literal não é comando git")
+    ok(alvos('git -C "/w/raiz/meu proj" pull') == [("pull", "/w/raiz/meu proj")], "aspas no caminho")
+    ok(alvos("git clean -fdx") == [("clean", "/w/raiz")], "clean")
+    ok(alvos("git restore --staged .") == [("restore", "/w/raiz")], "restore")
+    ok(alvos("git cherry-pick abc") == [("cherry-pick", "/w/raiz")], "cherry-pick")
+
+    # --- portão: topo do checkout e família ---------------------------------
+    base = os.path.realpath(tempfile.mkdtemp(prefix="abas-portao-"))   # /var -> /private/var
+    raiz = os.path.join(base, "raiz")
+    proj = os.path.join(raiz, "proj")
+    wt = os.path.join(base, "proj-wt", "feat")
+    fora = os.path.join(base, "fora")
+    for d in (os.path.join(raiz, ".git"), os.path.join(proj, ".git"), os.path.join(proj, "sub"),
+              wt, os.path.join(fora, ".git"), os.path.join(proj, ".git", "worktrees", "feat")):
+        os.makedirs(d, exist_ok=True)
+    with open(os.path.join(wt, ".git"), "w") as f:
+        f.write("gitdir: %s\n" % os.path.join(proj, ".git", "worktrees", "feat"))
+    ok(topo_do_checkout(os.path.join(proj, "sub")) == proj, "sobe até o .git do projeto")
+    ok(topo_do_checkout(os.path.join(proj, "sub", "x.py")) == proj, "arquivo também")
+    ok(topo_do_checkout(raiz) == raiz, "raiz é o próprio checkout")
+    ok(topo_do_checkout(wt) == wt, "worktree tem .git-arquivo e é checkout próprio")
+    ok(topo_do_checkout(base) is None, "fora de qualquer repo")
+    ok(repo_principal(wt) == proj, "worktree aponta para o repo principal")
+    ok(repo_principal(proj) == proj, "checkout principal aponta para si")
+    ok(repo_principal(fora) == fora, "repo avulso aponta para si")
+
+    # --- portão: decisão ------------------------------------------------------
+    def aba(pid, sid, checkout, rotulo=None):
+        return {"pid": pid, "session_id": sid, "checkout": checkout, "apelido": rotulo, "inicio": agora()}
+    eu = aba(meu, "eu", proj)
+    outra_proj = aba(outro_vivo, "outra", proj, "site-x")
+    outra_wt = aba(outro_vivo, "outra", wt, "feat")
+    outra_fora = aba(outro_vivo, "outra", fora)
+    dec = lambda cmd, cwd, abas, trinco=None: decidir_portao(
+        alvos_git(cmd, cwd), abas, meu_pid=meu, minha_sid="eu", raiz=raiz, trinco=trinco)
+    ok(dec("git merge a", proj, [eu]) is None, "sozinho: passa")
+    ok(dec("git merge a", proj, [eu, outra_wt]) is None, "outra aba em worktree do mesmo repo: o checkout é meu")
+    ok(dec("git merge a", wt, [eu, outra_wt]) is not None, "mesclar no worktree que a outra segura: nega")
+    m = dec("git checkout main", proj, [eu, outra_proj])
+    ok(m is not None and "site-x" in m and proj in m, "nega citando a aba e o checkout: %r" % m)
+    ok(dec("git status", proj, [eu, outra_proj]) is None, "status nunca nega")
+    ok(dec("git merge a", proj, [eu, outra_fora]) is None, "aba em outro repo não segura este")
+    ok(dec("git pull", fora, [eu, outra_fora]) is not None, "repo fora da raiz também é checkout de alguém")
+    ok(dec("git pull", raiz, [eu]) is None, "raiz sozinho: passa")
+    m = dec("git pull", raiz, [eu, outra_proj])
+    ok(m is not None and "trinco" in m, "raiz com outra aba e sem trinco: nega pedindo o trinco: %r" % m)
+    ok(dec("git pull", raiz, [eu, outra_proj], trinco={"pid": meu}) is None, "raiz com trinco meu: passa")
+    ok(dec("git pull", raiz, [eu, outra_proj], trinco={"pid": outro_vivo}) is not None, "trinco alheio não vale")
+    ok(dec("git merge a", proj, [aba(meu, "eu-clear", proj)]) is None, "mesmo pid com outro session_id sou eu (/clear)")
+    ok(dec("git merge a", proj, [aba(outro_vivo, "eu", proj)]) is None, "mesmo session_id sou eu")
+    ok(dec("cd %s && git merge a" % wt, raiz, [eu, outra_wt]) is not None, "cd para o worktree alheio: nega")
+
+    # --- portão: checkout de uma aba a partir do registro ---------------------
+    ok(checkout_da_aba({"cwd": proj, "transcript": ""}, raiz) == proj, "cwd dentro do projeto")
+    ok(checkout_da_aba({"cwd": wt, "transcript": ""}, raiz) == wt, "cwd no worktree")
+    tr = os.path.join(base, "t.jsonl")
+    with open(tr, "w") as f:
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+                 "input": {"command": "git -C %s status" % proj}}]}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit",
+                 "input": {"file_path": os.path.join(wt, "a.py")}}]}}) + "\n")
+    ok(checkout_da_aba({"cwd": raiz, "transcript": tr}, raiz) == wt, "aba na raiz: último caminho ESCRITO decide (Edit no worktree)")
+    with open(tr, "w") as f:
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+                 "input": {"command": "cd %s && pytest" % proj}}]}}) + "\n")
+    ok(checkout_da_aba({"cwd": raiz, "transcript": tr}, raiz) == proj, "cd no Bash reivindica")
+    with open(tr, "w") as f:
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read",
+                 "input": {"file_path": os.path.join(proj, "a.py")}}]}}) + "\n")
+    ok(checkout_da_aba({"cwd": raiz, "transcript": tr}, raiz) == raiz, "só ler não reivindica: fica na raiz")
+    shutil.rmtree(base, ignore_errors=True)
+
+    # --- portão de escrita: Write em arquivo compartilhado da camada OS -------
+    base2 = tempfile.mkdtemp(prefix="abas-escrita-")
+    for rel in ("STATUS.md", "CLAUDE.md", "brain/notas/x.md", "brain/notas/projetos/velho.md",
+                "brain/memoria/MEMORY.md", "brain/memoria/fato.md", "proj/app.py"):
+        os.makedirs(os.path.dirname(os.path.join(base2, rel)) or base2, exist_ok=True)
+        with open(os.path.join(base2, rel), "w") as f:
+            f.write("x")
+    j = lambda rel: os.path.join(base2, rel)
+    esc = lambda rel, outras, trinco=None: decidir_escrita(j(rel), outras, meu_pid=meu, raiz=base2, trinco=trinco)
+    outras = [aba(outro_vivo, "outra", None, "site-x")]
+    ok(esc("STATUS.md", []) is None, "sozinho: Write passa")
+    ok(esc("STATUS.md", outras) is not None, "STATUS.md com outra aba: nega")
+    ok(esc("CLAUDE.md", outras) is not None, "CLAUDE.md com outra aba: nega")
+    ok(esc("brain/notas/x.md", outras) is not None, "nota existente: nega")
+    ok(esc("brain/notas/projetos/velho.md", outras) is not None, "nota de projeto existente: nega")
+    ok(esc("brain/notas/projetos/novo.md", outras) is None, "nota que ainda não existe: passa (criar é legítimo)")
+    ok(esc("brain/memoria/MEMORY.md", outras) is not None, "índice de memória: nega")
+    ok(esc("brain/memoria/fato.md", outras) is None, "memória avulsa não é compartilhada: passa")
+    ok(esc("proj/app.py", outras) is None, "arquivo de projeto: fora do portão de escrita")
+    ok(decidir_escrita("/tmp/qualquer.md", outras, meu_pid=meu, raiz=base2) is None, "fora da raiz: passa")
+    ok(esc("STATUS.md", outras, trinco={"pid": meu}) is None, "com o trinco meu: passa")
+    elo = tempfile.mkdtemp(prefix="abas-elo-")
+    os.symlink(os.path.join(base2, "brain", "memoria"), os.path.join(elo, "memory"))
+    ok(decidir_escrita(os.path.join(elo, "memory", "MEMORY.md"), outras, meu_pid=meu, raiz=base2) is not None,
+       "MEMORY.md pelo symlink da memória: nega")
+    os.symlink(base2, os.path.join(elo, "raiz"))
+    ok(decidir_escrita(j("STATUS.md"), outras, meu_pid=meu, raiz=os.path.join(elo, "raiz")) is not None,
+       "raiz dada por symlink: nega")
+    shutil.rmtree(elo, ignore_errors=True)
+    if os.path.exists(j("status.md")):
+        ok(esc("status.md", outras) is not None, "FS sem caixa: status.md é STATUS.md")
+    ok(esc("STATUS.md", outras, trinco={"pid": outro_vivo}) is not None, "trinco alheio não vale")
+    m = esc("STATUS.md", outras)
+    ok("Edit" in m and "trinco" in m, "motivo ensina a saída (Edit ou trinco): %r" % m)
+    ok(esc("STATUS.md", [aba(meu, "eu", None)]) is None, "a única outra aba sou eu: passa")
+    shutil.rmtree(base2, ignore_errors=True)
+    return n
+
+
+def modo_selftest():
+    global REG, RAIZ
+    original = REG
+    tmp = tempfile.mkdtemp(prefix="abas-selftest-")
+    REG = tmp
+    try:
+        assert ler() == [], "registro vazio deve devolver lista vazia"
+
+        # PID vivo: o próprio processo do selftest
+        escrever({"session_id": "viva", "pid": os.getpid(), "cwd": RAIZ,
+                  "transcript": "", "inicio": agora(), "apelido": None})
+        # PID morto: 2**31-1 nunca existe no macOS
+        escrever({"session_id": "morta", "pid": 2147483647, "cwd": RAIZ,
+                  "transcript": "", "inicio": agora(), "apelido": None})
+        # Registro corrompido não pode derrubar a leitura
+        with open(os.path.join(tmp, "corrompida.json"), "w") as f:
+            f.write("{isso nao e json")
+
+        vistas = ler()
+        ids = sorted(r["session_id"] for r in vistas)
+        assert ids == ["viva"], "esperava só a viva, veio %r" % (ids,)
+        assert not os.path.exists(os.path.join(tmp, "morta.json")), "PID morto tinha que ser podado"
+        assert vivo(os.getpid()) is True
+        assert vivo(2147483647) is False
+
+        # /clear e compact renascem com session_id novo no MESMO pid:
+        # o registro antigo daquele pid tem que morrer, senão a aba conta duas vezes
+        escrever({"session_id": "antes-do-clear", "pid": os.getpid(), "cwd": RAIZ,
+                  "transcript": "", "inicio": agora(), "apelido": None})
+        limpar_pid(os.getpid())
+        escrever({"session_id": "depois-do-clear", "pid": os.getpid(), "cwd": RAIZ,
+                  "transcript": "", "inicio": agora(), "apelido": None})
+        ids = sorted(r["session_id"] for r in ler())
+        assert ids == ["depois-do-clear"], "um pid, um registro — veio %r" % (ids,)
+
+        # aba viva sem registro tem que aparecer como não registrada
+        fundidas = fundir([{"session_id": "viva", "pid": os.getpid(), "cwd": RAIZ,
+                            "transcript": "", "inicio": agora(), "apelido": None}],
+                          [os.getpid(), 999001])
+        por_pid = dict((a["pid"], a) for a in fundidas)
+        assert por_pid[os.getpid()]["registrada"] is True
+        assert por_pid[999001]["registrada"] is False
+        assert por_pid[999001]["session_id"] is None
+        assert len(fundidas) == 2, "toda aba viva aparece, registrada ou não"
+
+        # projeto sai do último tool_use do transcript, não do cwd
+        eventos = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Edit",
+                 "input": {"file_path": RAIZ + "/site-blog/app.py"}}]}},
+            {"type": "user", "message": {"content": "sobe o portal"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash",
+                 "input": {"command": "git -C " + RAIZ + "/site-loja status"}}]}},
+        ]
+        falso = os.path.join(tmp, "transcript.jsonl")
+        with open(falso, "w", encoding="utf-8") as f:
+            for e in eventos:
+                f.write(json.dumps(e) + "\n")
+        validos = ["site-blog", "site-loja"]
+        assert projeto_da_sessao(falso, RAIZ, validos) == "site-loja", "vale o mais recente"
+        assert projeto_da_sessao("", RAIZ, validos) == "—", "cwd na raiz não identifica projeto"
+        assert projeto_da_sessao("", os.path.join(RAIZ, "site-blog"), validos) == "site-blog"
+        assert ultimo_pedido(falso) == "sobe o portal"
+
+        # ler/citar não reivindica — só Edit/Write/NotebookEdit e git -C/cd em Bash tocam
+        eventos_leitura = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash",
+                 "input": {"command": "cat " + RAIZ + "/site-loja/README.md"}}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash",
+                 "input": {"command": "grep -r site-loja STATUS.md"}}]}},
+        ]
+        leitura = os.path.join(tmp, "leitura.jsonl")
+        with open(leitura, "w", encoding="utf-8") as f:
+            for e in eventos_leitura:
+                f.write(json.dumps(e) + "\n")
+        assert projeto_da_sessao(leitura, "", validos) == "—", \
+            "cat/grep menciona o projeto, não toca — não pode reivindicar"
+
+        eventos_edicao = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Edit",
+                 "input": {"file_path": RAIZ + "/site-loja/app.py"}}]}},
+        ]
+        edicao = os.path.join(tmp, "edicao.jsonl")
+        with open(edicao, "w", encoding="utf-8") as f:
+            for e in eventos_edicao:
+                f.write(json.dumps(e) + "\n")
+        assert projeto_da_sessao(edicao, "", validos) == "site-loja", \
+            "Edit num arquivo do repo tem que reivindicar"
+
+        # linha de transcript que não é objeto (formato interno, não contrato) não derruba o painel
+        transcript_ruim = os.path.join(tmp, "ruim.jsonl")
+        with open(transcript_ruim, "w", encoding="utf-8") as f:
+            # "123" por último no arquivo = primeira linha vista por _eventos (que
+            # varre de trás pra frente) — é essa ordem que exercita a guarda
+            f.write(json.dumps({"type": "user", "message": {"content": "antes do numero"}}) + "\n")
+            f.write("123\n")
+        assert ultimo_pedido(transcript_ruim) == "antes do numero", \
+            "linha não-objeto tem que ser pulada, não crashar"
+
+        # _tail não pode propagar erro de I/O — abrir um diretório como arquivo
+        # dispara IsADirectoryError; TOCTOU (exists() e depois open()) cai no mesmo balde
+        assert _tail(tmp) == [], "erro de I/O tem que falhar aberto, devolver vazio"
+
+        # _tail descarta a 1ª linha quando o corte a atravessa ao meio, mas
+        # preserva a última linha completa intacta
+        linha_boa = "y" * 50
+        grande = os.path.join(tmp, "grande.jsonl")
+        with open(grande, "w", encoding="utf-8") as f:
+            f.write("x" * 200 + "\n" + linha_boa + "\n")
+        assert _tail(grande, limite=60) == [linha_boa], "só a linha completa sobrevive ao corte"
+
+        # repo sujo que nenhuma aba viva reivindica é o alerta que importa
+        repos = [{"slug": "site-loja", "branch": "main", "sujos": 2,
+                  "ahead": 10, "behind": 0, "worktrees": 1},
+                 {"slug": "site-blog", "branch": "main", "sujos": 0,
+                  "ahead": 0, "behind": 0, "worktrees": 1}]
+        avisos = alertas([{"pid": 1, "projeto": "site-blog"}], repos)
+        assert any("site-loja" in a and "sujo" in a for a in avisos), avisos
+        assert not any("site-blog" in a for a in avisos), avisos
+        # duas abas no mesmo projeto colidem
+        avisos2 = alertas([{"pid": 1, "projeto": "site-loja"},
+                           {"pid": 2, "projeto": "site-loja"}], repos)
+        assert any("2 abas" in a and "site-loja" in a for a in avisos2), avisos2
+        # sem abas e sem repo sujo, silêncio
+        assert alertas([], [repos[1]]) == []
+        # aba com projeto "—" não pode passar por all-clear silencioso — tem que avisar
+        # que os alertas abaixo não a consideram (senão a fase de transição parece limpa)
+        avisos3 = alertas([{"pid": 1, "projeto": "—"}], repos)
+        assert any("sem projeto identificado" in a for a in avisos3), avisos3
+        assert any("site-loja" in a and "sujo" in a for a in avisos3), avisos3
+
+        # estado_repos() must work with real git state: covers three cases to ensure
+        # the @{u}...HEAD parsing is correct (behind/ahead assignment order).
+        # Skip if git is unavailable; also skip if fixture setup fails (timeout, OSError, etc).
+        try:
+            r = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=5)
+            git_available = r.returncode == 0
+        except Exception:
+            git_available = False
+
+        if git_available:
+            raiz_orig = RAIZ
+            tmpdir_ws = tempfile.mkdtemp(prefix="abas-estado-")
+            RAIZ = tmpdir_ws
+            try:
+                try:
+                    # Create bare repo as origin
+                    bare_path = os.path.join(tmpdir_ws, "origin.git")
+                    subprocess.run(["git", "init", "--bare", bare_path],
+                                  capture_output=True, timeout=5, check=True)
+
+                    # Clone it locally
+                    local_path = os.path.join(tmpdir_ws, "repo-async")
+                    subprocess.run(["git", "clone", bare_path, local_path],
+                                  capture_output=True, timeout=5, check=True)
+
+                    # Configure git in the local repo
+                    subprocess.run(["git", "-C", local_path, "config", "user.email", "test@test.local"],
+                                  capture_output=True, timeout=5, check=True)
+                    subprocess.run(["git", "-C", local_path, "config", "user.name", "Test"],
+                                  capture_output=True, timeout=5, check=True)
+
+                    # Make 3 commits and push all, pinning the branch name explicitly
+                    for i in range(1, 4):
+                        fpath = os.path.join(local_path, "file.txt")
+                        with open(fpath, "a") as f:
+                            f.write("line %d\n" % i)
+                        subprocess.run(["git", "-C", local_path, "add", "."],
+                                      capture_output=True, timeout=5, check=True)
+                        subprocess.run(["git", "-C", local_path, "commit", "-m", "commit %d" % i],
+                                      capture_output=True, timeout=5, check=True)
+
+                    # Push to origin, getting the current branch name rather than hardcoding
+                    r = subprocess.run(["git", "-C", local_path, "rev-parse", "--abbrev-ref", "HEAD"],
+                                      capture_output=True, text=True, timeout=5, check=True)
+                    current_branch = r.stdout.strip()
+                    subprocess.run(["git", "-C", local_path, "push", "-u", "origin", current_branch],
+                                  capture_output=True, timeout=5, check=True)
+
+                    # Now make asymmetric: reset to 2 behind, then make 1 new commit
+                    subprocess.run(["git", "-C", local_path, "reset", "--hard", "HEAD~2"],
+                                  capture_output=True, timeout=5, check=True)
+
+                    fpath = os.path.join(local_path, "file.txt")
+                    with open(fpath, "a") as f:
+                        f.write("local commit\n")
+                    subprocess.run(["git", "-C", local_path, "add", "."],
+                                  capture_output=True, timeout=5, check=True)
+                    subprocess.run(["git", "-C", local_path, "commit", "-m", "local"],
+                                  capture_output=True, timeout=5, check=True)
+
+                    # Add dirty file
+                    dirty = os.path.join(local_path, "dirty.txt")
+                    with open(dirty, "w") as f:
+                        f.write("dirty")
+
+                    # Create repo with no upstream
+                    no_up_path = os.path.join(tmpdir_ws, "repo-no-up")
+                    os.makedirs(no_up_path)
+                    subprocess.run(["git", "-C", no_up_path, "init", "--initial-branch=main"],
+                                  capture_output=True, timeout=5, check=True)
+                    subprocess.run(["git", "-C", no_up_path, "config", "user.email", "test@test.local"],
+                                  capture_output=True, timeout=5, check=True)
+                    subprocess.run(["git", "-C", no_up_path, "config", "user.name", "Test"],
+                                  capture_output=True, timeout=5, check=True)
+
+                    fpath = os.path.join(no_up_path, "file.txt")
+                    with open(fpath, "w") as f:
+                        f.write("content")
+                    subprocess.run(["git", "-C", no_up_path, "add", "."],
+                                  capture_output=True, timeout=5, check=True)
+                    subprocess.run(["git", "-C", no_up_path, "commit", "-m", "initial"],
+                                  capture_output=True, timeout=5, check=True)
+
+                    # Create repo with no commits
+                    no_cmts_path = os.path.join(tmpdir_ws, "repo-no-cmts")
+                    os.makedirs(no_cmts_path)
+                    subprocess.run(["git", "-C", no_cmts_path, "init", "--initial-branch=main"],
+                                  capture_output=True, timeout=5, check=True)
+
+                    # Test estado_repos()
+                    result = estado_repos(["repo-async", "repo-no-up", "repo-no-cmts"])
+                    by_slug = dict((r["slug"], r) for r in result)
+
+                    # Verify asymmetric repo (2 behind, 1 ahead, 1 dirty)
+                    async_r = by_slug["repo-async"]
+                    assert async_r["sujos"] == 1, "dirty: %d != 1" % async_r["sujos"]
+                    assert async_r["behind"] == 2, "behind: %d != 2" % async_r["behind"]
+                    assert async_r["ahead"] == 1, "ahead: %d != 1" % async_r["ahead"]
+
+                    # Verify no-upstream repo (0 behind, 0 ahead, 0 dirty)
+                    no_up_r = by_slug["repo-no-up"]
+                    assert no_up_r["behind"] == 0, "no-up behind"
+                    assert no_up_r["ahead"] == 0, "no-up ahead"
+                    assert no_up_r["sujos"] == 0, "no-up dirty"
+
+                    # Verify no-commits repo (0 behind, 0 ahead, 0 dirty)
+                    no_cmts_r = by_slug["repo-no-cmts"]
+                    assert no_cmts_r["behind"] == 0, "no-cmts behind"
+                    assert no_cmts_r["ahead"] == 0, "no-cmts ahead"
+                    assert no_cmts_r["sujos"] == 0, "no-cmts dirty"
+
+                except (subprocess.SubprocessError, OSError):
+                    # Setup failure (timeout, git config, OSError) is "cannot test", not "test failed"
+                    pass
+            finally:
+                RAIZ = raiz_orig
+                shutil.rmtree(tmpdir_ws, ignore_errors=True)
+
+        # a linha é uma linha, com teto de 5 e silêncio quando não há vizinho
+        base = {"pid": 1, "session_id": "s", "apelido": None, "projeto": "site-loja",
+                "inicio": agora(), "registrada": True}
+        assert linha_inventario([]) == "", "sozinho, silêncio absoluto"
+        uma = linha_inventario([base])
+        assert uma.startswith("Outras abas vivas:") and uma.count("\n") == 0, uma
+        assert "site-loja" in uma
+        muitas = linha_inventario([dict(base, pid=i, session_id="s%d" % i) for i in range(9)])
+        assert "+4" in muitas and muitas.count("\n") == 0, muitas
+        assert rotulo(dict(base, apelido="controle de terminais")) == "controle de terminais"
+
+        # caffeinate é o keepalive do próprio Claude Code, não trabalho do usuário —
+        # chama comando_em_execucao de verdade contra uma árvore sintética, não
+        # reimplementa o filtro inline (isso seria tautológico: sempre passaria)
+        SNAP = ("/bin/zsh -c source /Users/x/.claude/shell-snapshots/"
+                "snapshot-zsh-1700000000000-abc123.sh 2>/dev/null")
+        arvore_mista = {100: [(200, "caffeinate -i -t 300"), (300, SNAP)],
+                        300: [(201, "python3 serve.py")]}
+        assert comando_em_execucao(100, arvore=arvore_mista) == "python3 serve.py", \
+            "comando real no meio do caffeinate tem que sobreviver ao filtro"
+        # só caffeinate como filho = aba ociosa de verdade, tem que devolver None
+        arvore_so_caffeinate = {100: [(200, "caffeinate -i -t 300")]}
+        assert comando_em_execucao(100, arvore=arvore_so_caffeinate) is None, \
+            "só caffeinate como filho é o caso ocioso — não pode aparecer como 'fazendo agora'"
+
+        # servidor MCP é filho direto do claude e vive a sessão inteira: não é trabalho.
+        # Trabalho é só o que roda sob o shell da ferramenta Bash (shell-snapshots/).
+        # O MCP vem DEPOIS na árvore de propósito: o filtro antigo pegava o último candidato.
+        arvore_mcp = {100: [(300, SNAP), (200, "npm exec @playwright/mcp@latest --user-data-dir /x")],
+                      300: [(301, "pytest -q tests/")],
+                      200: [(201, "node /Users/x/.npm/_npx/9833/node_modules/.bin/mcp-server-playwright")]}
+        assert comando_em_execucao(100, arvore=arvore_mcp) == "pytest -q tests/", \
+            "MCP mais fundo na árvore não pode tomar o lugar do comando de verdade"
+        arvore_so_mcp = {100: [(200, "npm exec @playwright/mcp@latest")],
+                         200: [(201, "node /Users/x/.npm/_npx/9833/node_modules/.bin/mcp-server-playwright")]}
+        assert comando_em_execucao(100, arvore=arvore_so_mcp) is None, \
+            "só servidor MCP pendurado = aba ociosa"
+
+        # caminho de framework não pode comer o dado que importa (serve.py) ao truncar
+        interprete = ("/Library/Developer/CommandLineTools/Library/Frameworks/"
+                      "Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python")
+        arvore_framework = {100: [(300, SNAP)], 300: [(201, interprete + " serve.py")]}
+        fazendo = comando_em_execucao(100, arvore=arvore_framework)
+        assert "serve.py" in fazendo, "caminho de interpretador não pode truncar o que importa: %r" % fazendo
+
+        # nomear uma aba grava o apelido sem perder o resto do registro
+        escrever({"session_id": "batizada", "pid": os.getpid(), "cwd": RAIZ,
+                  "transcript": "", "inicio": agora(), "apelido": None})
+        cmd_nome("batizada", "controle de terminais")
+        achada = [r for r in ler() if r["session_id"] == "batizada"][0]
+        assert achada["apelido"] == "controle de terminais", achada
+        assert achada["pid"] == os.getpid(), "nomear não pode perder o resto do registro"
+
+        # mensagem de outra sessão chega como "user", mas não é pedido do dono;
+        # e pedido de várias linhas vira a primeira linha (é uma coluna de painel)
+        peer = os.path.join(tmp, "peer.jsonl")
+        with open(peer, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user", "message": {
+                "content": "abre o relatório\npra eu ver como está"}}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {
+                "content": "Another Claude session sent a message:\n"
+                           "<agent-message from=\"abc12345\">\n[Subagent]\n</agent-message>"}}) + "\n")
+        assert ultimo_pedido(peer) == "abre o relatório", ultimo_pedido(peer)
+
+        # "trabalhando" também sai da última escrita no transcript: a aba que está
+        # pensando não tem processo filho nenhum, e o painel a dava por ociosa
+        recente = os.path.join(tmp, "recente.jsonl")
+        with open(recente, "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        ha_2min = time.time() - 120
+        os.utime(recente, (ha_2min, ha_2min))
+        assert 115 <= ativo_ha(recente) <= 125, ativo_ha(recente)
+        assert ativo_ha("") is None, "aba sem transcript não tem idade de atividade"
+        assert ativo_ha(os.path.join(tmp, "sumiu.jsonl")) is None, "transcript sumido falha aberto"
+
+        # o JSON do painel: um documento só, serializável, com o veredito já tirado aqui
+        # (um dono por regra — o mod só desenha)
+        base_aba = {"pid": 1, "session_id": "s1", "apelido": None, "projeto": "site-blog",
+                    "inicio": agora(), "registrada": True, "transcript": "/x.jsonl",
+                    "cwd": RAIZ, "pedido": "sobe o portal"}
+        abas_teste = [dict(base_aba, pid=1, fazendo=None, ativo_ha_s=10),          # pensando
+                      dict(base_aba, pid=2, fazendo=None, ativo_ha_s=300),         # ociosa
+                      dict(base_aba, pid=3, fazendo="pytest -q", ativo_ha_s=300),  # comando longo
+                      dict(base_aba, pid=4, fazendo=None, ativo_ha_s=None)]        # sem transcript
+        doc = json.loads(json.dumps(montar_json(abas_teste, repos)))
+        trab = dict((a["pid"], a["trabalhando"]) for a in doc["abas"])
+        assert trab == {1: True, 2: False, 3: True, 4: False}, trab
+        primeira = doc["abas"][0]
+        for campo in ("pid", "session_id", "rotulo", "projeto", "idade", "fazendo",
+                      "pedido", "ativo_ha_s", "trabalhando", "registrada"):
+            assert campo in primeira, "falta %s no JSON da aba" % campo
+        assert primeira["rotulo"] == "site-blog", primeira
+        assert doc["repos"] == repos, "repos passam inteiros"
+        assert doc["alertas"] == alertas(abas_teste, repos), "alertas são os do painel em texto"
+        assert doc.get("gerado"), "sem carimbo de hora o painel não sabe se o dado é velho"
+
+        n2 = _selftest_trinco_e_portao()
+        print("selftest ok — 56 + %d asserts passaram" % n2)
+    finally:
+        REG = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        modo_selftest()
+        sys.exit(0)
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg in ("hook-start", "hook-end"):
+        try:
+            (cmd_hook_start if arg == "hook-start" else cmd_hook_end)()
+        except Exception:
+            pass                      # falha aberta: SÓ o caminho dos hooks — sessão nenhuma cai por isto
+        sys.exit(0)
+    if arg == "portao":
+        try:
+            cmd_portao()
+        except Exception:
+            pass                      # falha aberta: hook nunca derruba um comando por bug próprio
+        sys.exit(0)
+    if arg == "trinco":
+        sys.exit(cmd_trinco(sys.argv[2:]))
+    if arg == "nome" and len(sys.argv) >= 4:
+        sys.exit(cmd_nome(sys.argv[2], " ".join(sys.argv[3:])))
+    if arg == "json":
+        cmd_json()
+        sys.exit(0)
+    if arg and arg != "painel":
+        sys.stderr.write("subcomando desconhecido: %s\n" % arg)
+        sys.exit(2)
+    cmd_painel()

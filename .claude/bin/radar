@@ -1,0 +1,124 @@
+#!/bin/bash
+# radar [--resumo] — compara o STATUS.md com o estado real dos repos de projeto.
+# SÓ LEITURA: quem atualiza o STATUS.md continua sendo o /fim (dono único).
+# --resumo imprime apenas projetos com sinal (sujeira/branch sem merge); em
+# silêncio, nada — o heartbeat repassa as linhas na abertura da sessão.
+set -u
+SELF="$(cd "$(dirname "$0")" && pwd)"
+ROOT="${OS_ROOT:-$(cd "$SELF/../.." && pwd)}"
+exec python3 - "$ROOT" "$@" <<'PY'
+import datetime
+import os
+import re
+import subprocess
+import sys
+
+ROOT = sys.argv[1]
+RESUMO = "--resumo" in sys.argv[2:]
+
+
+def git(d, *a):
+    return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True)
+
+
+def varrer(root):
+    """[(slug, ultimo_commit, dias, sinais)] para cada projeto do STATUS com repo."""
+    status_p = os.path.join(root, "STATUS.md")
+    txt = ""
+    if os.path.isfile(status_p):
+        with open(status_p, encoding="utf-8") as f:
+            txt = f.read()
+    slugs = re.findall(r"\]\(brain/notas/projetos/([a-z0-9-]+)\.md\)", txt)
+    out = []
+    for slug in slugs:
+        d = os.path.join(root, slug)
+        if not os.path.isdir(os.path.join(d, ".git")):
+            d = os.path.join(root, "pessoal", slug)      # projeto pessoal mora em pessoal/<slug>/
+        if not os.path.isdir(os.path.join(d, ".git")):
+            continue
+        ult = git(d, "log", "-1", "--format=%cs %s").stdout.strip()
+        dirty = len([l for l in git(d, "status", "--porcelain").stdout.splitlines() if l.strip()])
+        main = "main" if git(d, "rev-parse", "-q", "--verify", "main").returncode == 0 else "master"
+        br = [b.strip().lstrip("*+ ") for b in
+              git(d, "branch", "--no-merged", main).stdout.splitlines() if b.strip()]
+        sinais = []
+        if dirty:
+            sinais.append(f"{dirty} arquivo(s) não commitados")
+        if br:
+            sinais.append("sem merge em " + main + ": " + ", ".join(br[:3]))
+        try:
+            dias = (datetime.date.today() - datetime.date.fromisoformat(ult.split()[0])).days
+        except Exception:
+            dias = None
+        out.append((slug, ult, dias, sinais))
+    return out
+
+
+def main():
+    linhas = []
+    for slug, ult, dias, sinais in varrer(ROOT):
+        if RESUMO:
+            if sinais:
+                linhas.append(f"radar [{slug}]: " + "; ".join(sinais))
+        else:
+            idade = f"{dias}d" if dias is not None else "?"
+            extra = (" · " + "; ".join(sinais)) if sinais else ""
+            linhas.append(f"[{slug}] último commit {ult} ({idade}){extra}")
+    for l in linhas:
+        print(l)
+    if not linhas and not RESUMO:
+        print("radar: nenhum repo de projeto encontrado via STATUS.md")
+    sys.exit(0)
+
+
+def _selftest():
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        run = lambda cwd, *a: subprocess.run(a, cwd=cwd, capture_output=True, text=True)
+        with open(os.path.join(d, "STATUS.md"), "w") as f:
+            f.write("| [Alfa](brain/notas/projetos/alfa.md) | x | x | x |\n"
+                    "| [Beta](brain/notas/projetos/beta.md) | x | x | x |\n")
+        # alfa: repo limpo, tudo mesclado → sem sinal
+        pa = os.path.join(d, "alfa")
+        os.makedirs(pa)
+        run(pa, "git", "init", "-q", "-b", "main")
+        run(pa, "git", "config", "user.email", "t@t")
+        run(pa, "git", "config", "user.name", "t")
+        with open(os.path.join(pa, "a.txt"), "w") as f:
+            f.write("a")
+        run(pa, "git", "add", "a.txt")
+        run(pa, "git", "commit", "-qm", "init")
+        # beta: sujeira + branch sem merge → dois sinais
+        pb = os.path.join(d, "beta")
+        os.makedirs(pb)
+        run(pb, "git", "init", "-q", "-b", "main")
+        run(pb, "git", "config", "user.email", "t@t")
+        run(pb, "git", "config", "user.name", "t")
+        with open(os.path.join(pb, "b.txt"), "w") as f:
+            f.write("b")
+        run(pb, "git", "add", "b.txt")
+        run(pb, "git", "commit", "-qm", "init")
+        run(pb, "git", "checkout", "-qb", "feature")
+        with open(os.path.join(pb, "c.txt"), "w") as f:
+            f.write("c")
+        run(pb, "git", "add", "c.txt")
+        run(pb, "git", "commit", "-qm", "feat")
+        run(pb, "git", "checkout", "-q", "main")
+        with open(os.path.join(pb, "sujo.txt"), "w") as f:
+            f.write("s")
+        rs = {slug: sinais for slug, _u, _d, sinais in varrer(d)}
+        assert rs["alfa"] == [], rs
+        assert any("não commitados" in s for s in rs["beta"]), rs
+        assert any("feature" in s for s in rs["beta"]), rs
+        print("radar selftest ok")
+    finally:
+        shutil.rmtree(d)
+
+
+if "--selftest" in sys.argv[2:]:
+    _selftest()
+else:
+    main()
+PY

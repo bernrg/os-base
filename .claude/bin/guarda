@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""guarda — a regra de segurança que não depende de ninguém lembrar dela.
+
+Hook GLOBAL (vai em ~/.claude/settings.json pelo `instalar`), para valer em toda sessão
+do Claude Code desta máquina, aberta na raiz do OS ou não.
+
+  guarda            PreToolUse/Bash: lê o JSON do evento no stdin e NEGA ou PERGUNTA.
+  guarda --fora     SessionStart/UserPromptSubmit: avisa quando a sessão abriu fora da
+                    raiz do OS e o assunto é de um projeto do OS.
+  guarda --selftest testes embutidos; exit 0 se tudo passa.
+
+NEGA (o Claude não roda; o motivo aparece para ele e para você):
+  - push forçado (reescreve o histórico no GitHub);
+  - `git clean` com -x/-X (apaga o que está fora do git: brain/privado/ e arquivo/ não têm backup);
+  - `git add -A`, `git add .`, `git add :/` e `git commit -a` no repositório da RAIZ do OS (add é por caminho);
+  - `rm -r` em cima da raiz, de brain/, brain/privado/, arquivo/, da sua pasta pessoal, com curinga
+    dentro de uma delas (`brain/*`), de um .git ou de um projeto inteiro do OS;
+  - commit que leva segredo (chave, token, senha, string de conexão, .env, .pem).
+PERGUNTA (o Claude Code para e pede a sua aprovação, com o que o comando faz):
+  - `git push` e tudo que sai da máquina e não volta (publicação, GitHub);
+  - o que apaga trabalho sem commit (`git reset --hard`, `git clean`, `git checkout .`, `git restore .`,
+    apagar ramo à força, `git stash drop`).
+
+Limites, ditos de propósito: é cinto de segurança, não barreira. Comando montado em
+variável, `eval`, `$(…)` ou script que chama git por dentro não é lido. O hook julga a
+chamada Bash INTEIRA antes de ela rodar: `git add x && git commit` é examinado pelo que
+está no disco naquele instante. Erro da própria guarda nunca derruba um comando (falha
+aberta): um hook que estoura bloquearia todo Bash da máquina.
+
+Contrato do hook (doc oficial lida em 2026-11-10, https://code.claude.com/docs/en/hooks):
+JSON no stdout com hookSpecificOutput.permissionDecision = deny | ask.
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+RAIZ = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+# ---- o que sai da máquina e não volta: PERGUNTA ---------------------------------
+SAI_DA_MAQUINA = [
+    (r"\bgit\b[^|;&\n]*\bpush\b(?!.*--dry-run)", "git push",
+     "O código sai desta máquina. Onde há publicação automática, o site muda sozinho."),
+    (r"\bvercel\b[^|;&\n]*--prod\b", "publicação em produção (Vercel)",
+     "O site no ar passa a servir este código imediatamente."),
+    (r"\bnetlify\s+deploy\b[^|;&\n]*--prod\b", "publicação em produção (Netlify)",
+     "O site no ar passa a servir este código imediatamente."),
+    (r"\bfirebase\s+deploy\b", "publicação (Firebase)", "Publica o que está na pasta agora."),
+    (r"\bwrangler\s+(?:deploy|publish)\b", "publicação (Cloudflare)", "Publica o que está na pasta agora."),
+    (r"\bnpm\s+publish\b", "npm publish", "Pacote publicado não se despublica de verdade."),
+    (r"\bgh\s+workflow\s+run\b", "GitHub Actions", "Dispara o workflow agora, com os segredos de produção."),
+    (r"\bgh\s+repo\s+(?:delete|create)\b", "criar ou apagar repositório no GitHub",
+     "Muda o que existe na sua conta do GitHub."),
+    (r"\bgh\s+pr\s+merge\b", "mesclar pull request no GitHub", "Entra no ramo principal do repositório no GitHub."),
+    (r"\bgh\s+release\s+create\b", "publicar versão no GitHub", "Fica visível para quem acompanha o repositório."),
+    (r"\bsupabase\s+db\s+push\b", "migração de banco", "Altera o banco. Nem toda migração tem caminho de volta."),
+]
+
+# ---- segredo em commit: NEGA ------------------------------------------------------
+# Formato inconfundível de chave: vale em qualquer arquivo, inclusive nos de exemplo.
+FORTES = [
+    ("chave privada", r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----"),
+    ("chave da AWS", r"\bAKIA[0-9A-Z]{16}\b"),
+    ("token do GitHub", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})"),
+    ("chave da Anthropic", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+    ("chave da OpenAI", r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}"),
+    ("chave do Google", r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    ("chave do Stripe", r"\b[sr]k_live_[0-9A-Za-z]{16,}"),
+    ("token do Slack", r"\bxox[baprs]-[0-9A-Za-z-]{10,}"),
+]
+FORTES = [(rotulo, re.compile(rx)) for rotulo, rx in FORTES]
+# Palpite, só fora de arquivo de exemplo: `senha = "…"` e string de conexão com senha.
+# Calibrado para NÃO negar código comum de site (rótulo de formulário, nome de cabeçalho,
+# URL, texto de tradução): o valor precisa ter 12+ caracteres, letra E número, e não
+# parecer exemplo, variável nem endereço. Senha fora desse molde passa: é limite assumido.
+ATRIBUICAO_RX = re.compile(r"(?i)(?<![A-Za-z0-9])[\w.-]*(?:senha|password|passwd|secret|token|api[_-]?key|"
+                           r"access[_-]?key)[\w.-]*[\"']?\s*[:=]\s*[\"']([^\"'\s]{12,})[\"']")
+CONEXAO_RX = re.compile(r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?)://"
+                        r"([^\s:/@]+):([^\s@]{3,})@([^\s/:?\"']+)")
+EXEMPLO_RX = re.compile(r"(?i)exemplo|example|sample|your|sua-|seu-|change-?me|placeholder|xxxx|\*\*\*|dummy|fake|"
+                        r"teste|test")
+SENHA_DE_EXEMPLO = {"password", "senha", "pass", "postgres", "root", "admin", "user", "secret", "mysql", "redis"}
+LOCAL = {"localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal", "db", "database", "postgres", "mysql", "redis"}
+# Exemplo e modelo podem ir ao git: é o jeito certo de documentar um .env.
+NOME_PERMITIDO = re.compile(r"\.env\.(?:example|exemplo|sample|template|modelo)$", re.I)
+NOME_SEGREDO = re.compile(r"(?:^|/)(?:\.env(?:\.[^/]*)?|[^/]*\.env|[^/]*\.pem|[^/]*\.p12|[^/]*\.pfx|"
+                          r"[^/]*\.key|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]*\.ovpn)$", re.I)
+TETO_ARQUIVO = 256_000        # arquivo sem rastreio maior que isso não é lido (não é código escrito à mão)
+TETO_ARQUIVOS = 200
+PRAZO = 5.0                   # segundos para a varredura inteira; o hook tem 20
+
+ATRIBUICAO = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+PREFIXO = {"then", "do", "else", "env", "command", "exec", "time", "nohup", "sudo", "{", "}", "!"}
+GLOB = re.compile(r"[*?\[]")
+
+
+def trechos(cmd):
+    """Parte o comando nos separadores de shell que estão FORA de aspas (`&&`, `||`, `;`, `|`,
+    `&`, quebra de linha, parênteses). Mensagem de commit entre aspas fica inteira."""
+    saida, buf, aspa, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if aspa:
+            buf.append(c)
+            if c == "\\" and aspa == '"' and i + 1 < len(cmd):
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if c == aspa:
+                aspa = None
+        elif c in "'\"":
+            aspa = c
+            buf.append(c)
+        elif c == "\\" and i + 1 < len(cmd):
+            buf.extend((c, cmd[i + 1]))
+            i += 2
+            continue
+        elif c in ";|&\n()":
+            saida.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    saida.append("".join(buf))
+    return saida
+
+
+def _palavras(trecho):
+    try:
+        return shlex.split(trecho, comments=False, posix=True)
+    except ValueError:
+        return trecho.split()
+
+
+def _real(caminho):
+    return os.path.realpath(caminho)
+
+
+def _til(caminho, home):
+    """`~` e `~/x` pela pasta pessoal dada (o teste usa uma de mentira)."""
+    if caminho == "~":
+        return home
+    return os.path.join(home, caminho[2:]) if caminho.startswith("~/") else caminho
+
+
+def comandos(cmd, cwd, home):
+    """[(pasta, palavras)] de cada comando simples, na ordem; a pasta segue os `cd` anteriores.
+    Leitura por texto: o que estiver em variável, `eval` ou dentro de aspas não é visto."""
+    saida, atual = [], cwd
+    for trecho in trechos(cmd):
+        p = _palavras(trecho)
+        while p and (ATRIBUICAO.match(p[0]) or p[0] in PREFIXO):
+            p = p[1:]
+        if not p:
+            continue
+        if p[0] == "cd" and len(p) > 1:
+            atual = os.path.normpath(os.path.join(atual, _til(p[1], home)))
+            continue
+        saida.append((atual, p))
+    return saida
+
+
+def chamadas_git(cmd, cwd, home=None):
+    """[(pasta, subcomando, argumentos)] de cada `git` do comando; a pasta segue `cd` e `-C`."""
+    home = home or os.path.expanduser("~")
+    saida = []
+    for atual, p in comandos(cmd, cwd, home):
+        if os.path.basename(p[0]) != "git":
+            continue
+        pasta, i = atual, 1
+        while i < len(p) and p[i].startswith("-"):
+            if p[i] == "-C" and i + 1 < len(p):
+                pasta = os.path.normpath(os.path.join(pasta, _til(p[i + 1], home)))
+                i += 2
+            elif p[i] in ("-c", "--git-dir", "--work-tree", "--namespace") and i + 1 < len(p):
+                i += 2
+            else:
+                i += 1
+        if i < len(p):
+            saida.append((pasta, p[i], p[i + 1:]))
+    return saida
+
+
+def _curtas(args):
+    """Letras das opções curtas agrupadas (`-fdx` → f, d, x), até o `--`."""
+    letras = set()
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("-") and not a.startswith("--"):
+            letras.update(a[1:])
+    return letras
+
+
+def _caminhos(args):
+    """Os argumentos que são caminho: o que não é opção, e tudo depois do `--`."""
+    if "--" in args:
+        i = args.index("--")
+        return [a for a in args[:i] if not a.startswith("-")] + args[i + 1:]
+    return [a for a in args if not a.startswith("-")]
+
+
+COM_VALOR = {"-m", "--message", "-F", "--file", "--author", "--date", "-C", "-c", "--reuse-message",
+             "--reedit-message", "--fixup", "--squash", "-t", "--template", "--cleanup", "--trailer"}
+
+
+def _sem_valores(args):
+    """Argumentos do `git commit` sem o texto da mensagem: `-m '-a'` não é a opção `-a`."""
+    saida, pula = [], False
+    for i, a in enumerate(args):
+        if pula:
+            pula = False
+            continue
+        if a == "--":
+            saida.extend(args[i:])
+            break
+        if a in COM_VALOR:
+            pula = True
+        elif a.startswith("-m") and not a.startswith("--") and len(a) > 2:
+            continue                                   # -m"texto colado"
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 2 and a[-1] in "mFCct":
+            saida.append(a[:-1])                       # -am "texto": fica o -a
+            pula = True
+        else:
+            saida.append(a)
+    return saida
+
+
+def _git(pasta, *args):
+    try:
+        r = subprocess.run(["git", "-C", pasta, *args], capture_output=True, timeout=3)
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def _topo(pasta):
+    """Raiz do repositório git que contém `pasta` (a própria pasta, se não der para saber)."""
+    return _real(_git(pasta, "rev-parse", "--show-toplevel").strip() or pasta)
+
+
+def _valor_suspeito(v):
+    return (any(c.isalpha() for c in v) and any(c.isdigit() for c in v)
+            and not any(c in v for c in "${<(") and "://" not in v and not v.startswith(("/", "./", "http", "#"))
+            and not EXEMPLO_RX.search(v))
+
+
+def segredos_no_texto(texto, so_fortes=False):
+    achados = {rotulo for rotulo, rx in FORTES if rx.search(texto)}
+    if not so_fortes:
+        if any(_valor_suspeito(m.group(1)) for m in ATRIBUICAO_RX.finditer(texto)):
+            achados.add("senha ou token escrito no arquivo")
+        for m in CONEXAO_RX.finditer(texto):
+            senha, host = m.group(2), m.group(3).lower()
+            if (host not in LOCAL and senha.lower() not in SENHA_DE_EXEMPLO and not EXEMPLO_RX.search(senha)
+                    and not any(c in senha for c in "${<")):
+                achados.add("string de conexão com senha")
+    return sorted(achados)
+
+
+def segredos_do_commit(pasta, rastreados=False, soltos=None):
+    """[(arquivo, o que parece)] do que o commit levaria. Nunca devolve o segredo.
+    Sempre olha o índice. `rastreados`: também o que mudou e ainda não está no índice
+    (`commit -a`, ou `git add` na mesma chamada). `soltos`: lista de caminhos do `git add`
+    da mesma chamada ([] = tudo), para ler também os arquivos novos que ele levaria."""
+    fim = time.monotonic() + PRAZO
+    achados = []
+
+    def nome(arq):
+        if NOME_SEGREDO.search(arq) and not NOME_PERMITIDO.search(arq):
+            achados.append((arq, "arquivo de segredo pelo nome"))
+
+    def diff(texto):
+        arq = "?"
+        for linha in texto.splitlines():
+            if linha.startswith("+++ "):
+                arq = linha[6:] if linha.startswith("+++ b/") else linha[4:]
+            elif linha.startswith("+"):
+                for rotulo in segredos_no_texto(linha[1:], so_fortes=bool(NOME_PERMITIDO.search(arq))):
+                    achados.append((arq, rotulo))
+
+    for arq in _git(pasta, "diff", "--cached", "--name-only", "--diff-filter=ACMR").splitlines():
+        nome(arq)
+    diff(_git(pasta, "diff", "--cached", "-U0", "--no-color"))
+    filtro = ["--", *soltos] if soltos else []
+    if rastreados or soltos is not None:
+        diff(_git(pasta, "diff", "-U0", "--no-color", *([] if rastreados else filtro)))
+    if soltos is not None:
+        topo = _topo(pasta)
+        novos = _git(pasta, "ls-files", "--others", "--exclude-standard", "--full-name", *filtro).splitlines()
+        for arq in novos[:TETO_ARQUIVOS]:
+            if time.monotonic() > fim:
+                break
+            nome(arq)
+            caminho = os.path.join(topo, arq)
+            try:
+                if os.path.getsize(caminho) > TETO_ARQUIVO:
+                    continue
+                with open(caminho, encoding="utf-8", errors="replace") as f:
+                    for rotulo in segredos_no_texto(f.read(), so_fortes=bool(NOME_PERMITIDO.search(arq))):
+                        achados.append((arq, rotulo))
+            except OSError:
+                continue
+    vistos, unicos = set(), []
+    for a in achados:
+        if a not in vistos:
+            vistos.add(a)
+            unicos.append(a)
+    return unicos
+
+
+def protegidos(raiz, home):
+    return {_real(raiz), _real(os.path.join(raiz, "brain")), _real(os.path.join(raiz, "brain", "privado")),
+            _real(os.path.join(raiz, "arquivo")), _real(home), _real(os.path.join(home, "Documents")),
+            _real(os.path.join(home, "Desktop")), "/"}
+
+
+def rm_perigoso(cmd, cwd, raiz, home):
+    """(argumento, motivo) do `rm -r` que não pode rodar, ou None. Nega: pasta protegida ou
+    pasta que contém uma; curinga dentro de pasta protegida (o shell expande depois: quem
+    apaga `brain/*` apagou brain/); um `.git`; e um repositório inteiro dentro do OS."""
+    guardados, raiz_real = protegidos(raiz, home), _real(raiz)
+    PROTEGIDA = ("apagaria pasta protegida (a raiz do OS, brain/, brain/privado/, arquivo/ ou a sua pasta "
+                 "pessoal). O que está fora do git não tem backup. Apague só o arquivo ou a subpasta exata, pelo nome")
+
+    def guardada(alvo):
+        return any(alvo == g or g.startswith(alvo.rstrip("/") + "/") for g in guardados)
+
+    for atual, p in comandos(cmd, cwd, home):
+        if os.path.basename(p[0]) != "rm":
+            continue
+        args = p[1:]
+        if not ({"r", "R"} & _curtas(args) or "--recursive" in args):
+            continue
+        for a in _caminhos(args):
+            bruto = _til(a, home)
+            if GLOB.search(bruto):
+                partes = bruto.split("/")
+                corte = next(i for i, x in enumerate(partes) if GLOB.search(x))
+                base = "/".join(partes[:corte]) or ("/" if bruto.startswith("/") else ".")
+                if guardada(_real(os.path.join(atual, base))):
+                    return a, "tem curinga dentro de pasta protegida e " + PROTEGIDA
+                candidatos = glob.glob(os.path.join(atual, bruto))[:500]
+            else:
+                candidatos = [os.path.join(atual, bruto.rstrip("/") or "/")]
+            for c in candidatos:
+                alvo = _real(c)
+                if guardada(alvo):
+                    return a, PROTEGIDA
+                if os.path.basename(alvo) == ".git":
+                    return a, "apagaria o histórico inteiro de um repositório (a pasta .git)"
+                if (alvo + "/").startswith(raiz_real + "/") and os.path.exists(os.path.join(alvo, ".git")):
+                    return a, ("apagaria um projeto inteiro, com o histórico git dele; commit que não subiu para "
+                               "o GitHub some junto. Se é isso mesmo, quem apaga é você, no Finder ou no terminal")
+    return None
+
+
+def add_em_bloco(args, pasta, topo):
+    """`git add` que leva a árvore inteira: -A/-u, ou caminho que é a raiz do repositório."""
+    curtas = _curtas(args)
+    if "--all" in args or "--update" in args or "--no-ignore-removal" in args or {"A", "u"} & curtas:
+        return True
+    for a in _caminhos(args):
+        if a in ("*", ":/", ":/.", ":/*") or a.startswith(":(top)"):
+            return True
+        if not GLOB.search(a) and _real(os.path.join(pasta, a)) == topo:
+            return True                                # `.`, `./`, `..` a partir de uma subpasta
+    return False
+
+
+def decidir(cmd, cwd, raiz=RAIZ, home=None):
+    """("deny" | "ask", motivo) ou None. Negar vence perguntar."""
+    home = home or os.path.expanduser("~")
+    raiz_real = _real(raiz)
+    perguntas = []
+
+    rm = rm_perigoso(cmd, cwd, raiz, home)
+    if rm is not None:
+        return ("deny", f"`rm -r` em `{rm[0]}` {rm[1]}.")
+
+    gits = chamadas_git(cmd, cwd, home)
+    for pasta, sub, args in gits:
+        curtas = _curtas(args)
+        topo = _topo(pasta)
+        na_raiz = topo == raiz_real
+        if sub == "push":
+            if ("--force" in args or "--force-with-lease" in args or "--mirror" in args or "f" in curtas
+                    or any(a.startswith("--force-with-lease=") or a.startswith("--force-if-includes") for a in args)
+                    or any(a.startswith("+") and len(a) > 1 for a in args)):
+                return ("deny", "Push forçado reescreve o histórico no GitHub e apaga commit que só existe lá. "
+                                "Regra do OS: histórico publicado não se reescreve. Se for mesmo necessário, "
+                                "quem roda é você, no seu terminal.")
+        elif sub == "clean":
+            if {"x", "X"} & curtas:
+                return ("deny", "`git clean` com -x apaga o que está FORA do git. Na raiz isso inclui "
+                                "brain/privado/ e arquivo/, que não têm backup. Regra do OS: nunca.")
+            perguntas.append(("git clean", "Apaga arquivo novo que ainda não foi para o git. Não tem desfazer."))
+        elif sub == "add" and na_raiz and add_em_bloco(args, pasta, topo):
+            return ("deny", "No repositório da raiz do OS o `git add` é sempre POR CAMINHO "
+                            "(`git add STATUS.md brain/notas/x.md`). `-A`, `-u`, `.` e `:/` levam junto o que é "
+                            "de outra sessão.")
+        elif sub == "reset" and ("--hard" in args or "--merge" in args):
+            perguntas.append(("git reset --hard", "Apaga toda mudança sem commit. Não tem desfazer."))
+        elif sub == "branch" and ("D" in curtas or ({"d", "f"} <= curtas) or
+                                  ("--force" in args and ("--delete" in args or "d" in curtas))
+                                  or ("--delete" in args and "f" in curtas)):
+            perguntas.append(("apagar ramo à força", "Apaga o ramo mesmo com trabalho que não foi mesclado."))
+        elif sub == "stash" and args[:1] in (["drop"], ["clear"]):
+            perguntas.append(("git stash " + args[0], "Joga fora trabalho guardado. Não tem desfazer."))
+        elif sub in ("checkout", "restore") and any(
+                a in ("*", ":/") or (not GLOB.search(a) and a.rstrip("/") in (".", "..")) for a in _caminhos(args)):
+            perguntas.append((f"git {sub} em todos os arquivos",
+                              "Descarta toda mudança sem commit desta pasta. Não tem desfazer."))
+        if sub == "commit":
+            limpos = _sem_valores(args)
+            de_tudo = "a" in _curtas(limpos) or "--all" in limpos
+            if na_raiz and de_tudo:
+                return ("deny", "No repositório da raiz do OS o commit é sempre POR CAMINHO "
+                                "(`git commit --only -m … -- <caminhos>`). `-a` leva junto o que é de outra sessão.")
+            adds = [a for p, s, a in gits if s == "add" and _topo(p) == topo]
+            soltos = None
+            if adds:
+                soltos = [] if any(add_em_bloco(a, pasta, topo) or not _caminhos(a) for a in adds) else \
+                    [c for a in adds for c in _caminhos(a)]
+            achados = segredos_do_commit(pasta, rastreados=de_tudo, soltos=soltos)
+            if achados:
+                lista = "; ".join(f"{arq} ({oque})" for arq, oque in achados[:8])
+                return ("deny", "Este commit levaria segredo para o git: " + lista + ". Regra do OS: segredo "
+                                "nunca é versionado, em nenhum repositório. Tire o valor do arquivo (variável de "
+                                "ambiente, ou arquivo fora do repositório), confira com `git status` e comite de "
+                                "novo. Se o valor já foi escrito em algum commit, trate como vazado e troque-o. "
+                                "Se for alarme falso (texto que só parece senha), diga isso a quem é dono do OS: "
+                                "quem decide é a pessoa, e o commit ela mesma faz no terminal.")
+
+    for rx, rotulo, efeito in SAI_DA_MAQUINA:
+        if re.search(rx, cmd):
+            perguntas.append((rotulo, efeito))
+    if not perguntas:
+        return None
+    vistos, linhas = set(), ["Antes de aprovar, leia o que este comando faz:", ""]
+    for rotulo, efeito in perguntas:
+        if rotulo not in vistos:
+            vistos.add(rotulo)
+            linhas.append(f"  • {rotulo} — {efeito}")
+    linhas += ["", "Três perguntas antes do sim:", "  1. Como se desfaz?",
+               "  2. Qual é a janela para desfazer?", "  3. Passada a janela, o que fica feito para sempre?"]
+    return ("ask", "\n".join(linhas))
+
+
+def modo_bash(dados):
+    if dados.get("tool_name") not in (None, "Bash"):
+        return None
+    cmd = (dados.get("tool_input") or {}).get("command") or ""
+    if not cmd.strip():
+        return None
+    r = decidir(cmd, dados.get("cwd") or os.getcwd())
+    if not r:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "permissionDecision": r[0], "permissionDecisionReason": r[1]}}
+
+
+# ---- sessão aberta fora da raiz ----------------------------------------------------
+def gatilhos(raiz):
+    """Nome da pasta do OS e slug de cada projeto: é o que denuncia assunto do OS."""
+    nomes = {os.path.basename(raiz.rstrip("/")).lower()}
+    d = os.path.join(raiz, "brain", "notas", "projetos")
+    if os.path.isdir(d):
+        nomes.update(os.path.splitext(f)[0].lower() for f in os.listdir(d) if f.endswith(".md"))
+    return {n for n in nomes if len(n) >= 3}
+
+
+def modo_fora(dados, raiz=RAIZ, marcas=None):
+    cwd = _real(dados.get("cwd") or os.getcwd())
+    raiz_real = _real(raiz)
+    if cwd == raiz_real:
+        return None                              # na raiz: CLAUDE.md e hooks do projeto já valem
+    dentro = cwd.startswith(raiz_real + os.sep)
+    evento = dados.get("hook_event_name", "")
+    texto = (dados.get("prompt", "") if evento == "UserPromptSubmit" else cwd).lower()
+    if not dentro and not any(g in texto for g in gatilhos(raiz)):
+        return None
+    marca = os.path.join(marcas or tempfile.gettempdir(),
+                         "os-guarda-%s" % re.sub(r"[^A-Za-z0-9_-]", "", str(dados.get("session_id", "x"))))
+    if os.path.exists(marca):
+        return None                              # já avisou nesta sessão
+    try:
+        open(marca, "w").close()
+    except OSError:
+        pass
+    regras = ""
+    try:
+        with open(os.path.join(raiz, "CLAUDE.md"), encoding="utf-8") as f:
+            md = f.read()
+        for secao in ("## Segurança e git", "## Ritmo de sessão"):
+            m = re.search(re.escape(secao) + r"\n(.*?)(?=\n## |\Z)", md, re.S)
+            if m:
+                regras += secao + "\n" + m.group(1).strip() + "\n\n"
+    except OSError:
+        regras = "(não consegui ler o CLAUDE.md da raiz)\n"
+    aviso = (f"Sessão aberta em {cwd}, e não na raiz do OS ({raiz_real}). As regras e os rituais do OS "
+             "só carregam inteiros quando a sessão abre na raiz.")
+    contexto = ("[guarda do OS] " + aviso + " Antes de agir: (1) diga isso em uma linha a quem está na sessão "
+                "e sugira reabrir na raiz; (2) leia o CLAUDE.md da raiz inteiro; (3) siga estas seções desde já, "
+                "em especial: nunca git push sem pedido explícito daquele push, fim de sessão pelo ritual /fim, "
+                "git add sempre por caminho.\n\n" + regras)
+    return {"systemMessage": "⚠ " + aviso + " Regras injetadas no contexto.",
+            "hookSpecificOutput": {"hookEventName": evento, "additionalContext": contexto}}
+
+
+def main():
+    # Um hook que estoura bloqueia TODO comando de Bash. Falha em silêncio, sempre.
+    try:
+        dados = json.load(sys.stdin)
+        saida = modo_fora(dados) if "--fora" in sys.argv else modo_bash(dados)
+        if saida:
+            sys.stdout.write(json.dumps(saida, ensure_ascii=False))   # de uma vez: JSON pela metade perderia a decisão
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+# ---- testes embutidos --------------------------------------------------------------
+def _selftest():
+    import shutil
+    tmp = _real(tempfile.mkdtemp(prefix="guarda-selftest-"))
+    n = 0
+
+    def ok(cond, msg):
+        nonlocal n
+        assert cond, msg
+        n += 1
+
+    try:
+        raiz, home = os.path.join(tmp, "home", "Documents", "OS"), os.path.join(tmp, "home")
+        site = os.path.join(raiz, "site")
+        for d in (os.path.join(raiz, "brain", "privado"), os.path.join(raiz, "arquivo"),
+                  os.path.join(raiz, "brain", "notas", "projetos"), site, os.path.join(home, "Desktop")):
+            os.makedirs(d)
+        run = lambda cwd, *a: subprocess.run(a, cwd=cwd, capture_output=True, text=True)
+        for repo in (raiz, site):
+            run(repo, "git", "init", "-q", "-b", "main")
+            run(repo, "git", "config", "user.email", "t@t")
+            run(repo, "git", "config", "user.name", "t")
+        d = lambda cmd, cwd=raiz: decidir(cmd, cwd, raiz=raiz, home=home)
+        tipo = lambda cmd, cwd=raiz: (d(cmd, cwd) or (None,))[0]
+
+        # -- leitura do comando
+        ok(chamadas_git("cd site && git -C ../x status", raiz)[0][0] == os.path.join(raiz, "x"), "cd e -C compõem")
+        ok(chamadas_git("FOO=1 git commit -m 'a; b'", raiz)[0][1] == "commit", "atribuição antes do git")
+        ok(chamadas_git("echo git push", raiz) == [], "git como argumento de outro comando não conta")
+        ok(len([t for t in trechos("git commit -m 'a; rm -rf brain | x' && ls") if t.strip()]) == 2,
+           "separador dentro de aspas não parte")
+        ok(d("git commit --only -m 'tira o rm -rf brain; e o git push --force do script' -- STATUS.md") is None
+           or d("git commit --only -m 'tira o rm -rf brain; e o git push --force do script' -- STATUS.md")[0] == "ask",
+           "texto perigoso DENTRO da mensagem de commit não é comando")
+        ok(chamadas_git("(cd site && git add -A)", raiz)[0][0] == site, "parêntese de subshell não esconde o cd")
+
+        # -- inofensivos passam em silêncio
+        for cmd in ("git status", "git add STATUS.md brain/notas/x.md", "git commit --only -m x -- STATUS.md",
+                    "ls -la", "rm -rf site/node_modules", "rm arquivo.txt", "git push --dry-run",
+                    "git log --oneline -5", "grep -rn push .", "git diff --stat"):
+            ok(d(cmd) is None, "devia passar: %r → %r" % (cmd, d(cmd)))
+
+        # -- sai da máquina: pergunta
+        for cmd in ("git push", "git push origin main", "git -C site push -u origin main", "cd site && git push",
+                    "vercel deploy --prod", "netlify deploy --dir=dist --prod", "firebase deploy",
+                    "npm publish", "gh repo create x --private", "gh workflow run deploy.yml"):
+            ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
+        ok("Como se desfaz?" in d("git push")[1], "a pergunta traz o plano de reversão")
+
+        # -- push forçado: nega (todas as grafias)
+        for cmd in ("git push --force", "git push -f origin main", "git push --force-with-lease",
+                    "git push origin +main", "git -C site push --force-with-lease=main", "git push -uf origin x"):
+            ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
+
+        # -- git clean
+        ok(tipo("git clean -fdx") == "deny", "clean -fdx nega")
+        ok(tipo("git clean -fdX") == "deny", "clean -X nega")
+        ok(tipo("git -C site clean -xfd") == "deny", "clean -x nega em qualquer repo")
+        ok(tipo("git clean -fd") == "ask", "clean sem -x pergunta")
+        ok(tipo("git reset --hard HEAD~1") == "ask", "reset --hard pergunta")
+        ok(tipo("git reset HEAD arquivo") is None, "reset sem --hard passa")
+        ok(tipo("git branch -D velho") == "ask", "branch -D pergunta")
+        for cmd in ("git branch -d -f velho", "git branch --delete --force velho", "git stash drop", "git stash clear",
+                    "git checkout -- .", "git checkout .", "git restore .", "git restore --staged --worktree .",
+                    "git -C site checkout .", "gh pr merge 3", "gh release create v1"):
+            ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
+        for cmd in ("git checkout -b novo", "git checkout main", "git restore index.html", "git stash", "git stash pop",
+                    "git branch -d velho", "git checkout -- index.html"):
+            ok(d(cmd) is None, "devia passar: %r → %r" % (cmd, d(cmd)))
+
+        # -- add em bloco: só na raiz
+        for cmd in ("git add -A", "git add .", "git add --all", "git add -u", "git commit -am x",
+                    "git commit -a -m x", "cd %s && git add -A" % raiz, "git -C %s add ." % raiz):
+            ok(tipo(cmd, site if raiz in cmd else raiz) == "deny", "devia negar na raiz: %r" % cmd)
+        for cmd, onde in (("git add ./", raiz), ("git add :/", raiz), ("git add -A", os.path.join(raiz, "brain")),
+                          ("cd brain && git add -A", raiz), ("git -C brain add -A", raiz),
+                          ("(cd %s && git add -A)" % raiz, site), ("git add ..", os.path.join(raiz, "brain")),
+                          ("git commit -am 'x'", os.path.join(raiz, "brain"))):
+            ok(tipo(cmd, onde) == "deny", "add em bloco no repo da raiz devia negar: %r em %s → %r" % (cmd, onde, d(cmd, onde)))
+        ok(tipo("git add .", os.path.join(raiz, "brain")) is None, "`add .` de dentro de brain/ é por caminho: passa")
+        ok(tipo("git add brain .claude STATUS.md") is None, "add de pastas pelo nome passa")
+        ok(tipo("git commit --only -m '-a' -- STATUS.md") is None, "mensagem '-a' não é a opção -a")
+        ok(tipo("git commit -m 'arruma a fila' -- STATUS.md") is None, "letra a na mensagem não é a opção -a")
+        ok(tipo("git add -A", site) is None, "add -A dentro do projeto passa")
+        ok(tipo("git -C site add -A") is None, "add -A no projeto por -C passa")
+        ok(tipo("cd site && git add .") is None, "add . no projeto depois de cd passa")
+
+        # -- rm -r em pasta protegida
+        for cmd in ("rm -rf brain/privado", "rm -rf arquivo/", "rm -r brain", "rm -rf .", "rm -rf ./",
+                    "rm -rf %s" % raiz, "rm -rf ~", "rm -rf ~/Documents", "rm -fr .git", "rm -rf site/.git",
+                    "rm -rf /", "cd brain && rm -rf privado", "rm --recursive arquivo", "sudo rm -rf brain",
+                    "rm -rf %s" % os.path.join(home, "Documents")):
+            ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
+        ok(tipo("rm -rf %s" % tmp) == "deny", "pasta que CONTÉM uma protegida também é negada")
+        with open(os.path.join(raiz, "brain", "privado", "diario.md"), "w") as f:
+            f.write("x")
+        os.makedirs(os.path.join(site, "dist"))
+        os.makedirs(os.path.join(site, "node_modules", "pacote"))
+        for cmd, onde in (("rm -rf brain/*", raiz), ("rm -rf brain/privado/*", raiz), ("rm -rf *", raiz),
+                          ("rm -rf ./*", raiz), ("rm -rf ~/Documents/*", raiz), ("rm -rf b*", raiz),
+                          ("rm -rf arquivo/*", raiz), ("rm -rf -- brain", raiz), ("rm -rf site", raiz),
+                          ("rm -rf ../site", os.path.join(raiz, "brain")), ("rm -rf .*", site)):
+            ok(tipo(cmd, onde) == "deny", "devia negar: %r em %s → %r" % (cmd, onde, d(cmd, onde)))
+        for cmd, onde in (("rm -rf node_modules", site), ("rm -rf dist .next", site), ("rm -rf dist/*", site),
+                          ("rm -rf site/dist", raiz), ("rm -rf site/node_modules/*", raiz), ("rm -rf *.map", site),
+                          ("rm -rf brain/notas/diario/*.tmp", raiz), ("rm -rf %s" % os.path.join(tmp, "fora"), raiz)):
+            ok(d(cmd, onde) is None, "devia passar: %r em %s → %r" % (cmd, onde, d(cmd, onde)))
+        ok(tipo("rm -rf brain/notas/diario/2020-01-01.md") is None, "rm de um arquivo dentro de brain passa")
+        ok(tipo("rm brain/privado") is None, "rm sem -r não apaga pasta: passa")
+
+        # -- segredo no commit
+        chave = "sk-" + "ant-" + "a1B2" * 8
+        with open(os.path.join(site, "config.js"), "w") as f:
+            f.write('const k = "%s";\n' % chave)
+        ok(d("git commit -m x", site) is None, "arquivo com segredo fora do índice não barra commit simples")
+        run(site, "git", "add", "config.js")
+        r = d("git commit -m x", site)
+        ok(r and r[0] == "deny" and "config.js" in r[1], "segredo em stage nega e cita o arquivo: %r" % (r,))
+        ok(chave not in r[1], "o motivo nunca repete o segredo")
+        ok(tipo("git -C site commit -m x") == "deny", "vale por -C a partir da raiz")
+        run(site, "git", "rm", "-q", "--cached", "config.js")
+        ok(tipo("git add config.js && git commit -m x", site) == "deny", "add e commit na mesma chamada: lê o disco")
+        os.remove(os.path.join(site, "config.js"))
+
+        with open(os.path.join(site, ".env"), "w") as f:
+            f.write("PORTA=3000\n")
+        run(site, "git", "add", "-f", ".env")
+        r = d("git commit -m x", site)
+        ok(r and r[0] == "deny" and ".env" in r[1], ".env em stage nega pelo nome: %r" % (r,))
+        run(site, "git", "rm", "-q", "--cached", ".env")
+        os.remove(os.path.join(site, ".env"))
+
+        with open(os.path.join(site, ".env.example"), "w") as f:
+            f.write("CHAVE_DA_API=\nSENHA=\n")
+        with open(os.path.join(site, "index.html"), "w") as f:
+            f.write('<input type="password" name="senha">\n<p>token de acesso</p>\n')
+        run(site, "git", "add", ".env.example", "index.html")
+        ok(d("git commit -m x", site) is None, ".env.example vazio e HTML comum passam: %r" % (d("git commit -m x", site),))
+        run(site, "git", "commit", "-qm", "base")
+
+        # código comum de site e exemplo preenchido NÃO são segredo
+        with open(os.path.join(site, ".env.example"), "w") as f:
+            f.write('API_KEY="sua-chave-aqui"\nDATABASE_URL="postgres' + '://user:password@localhost/db"\n')
+        with open(os.path.join(site, "app.js"), "w") as f:
+            f.write('const t = { password: "Contraseña", senha: "Senha de acesso" };\n'
+                    'const tokenKey = "auth_token";\nconst api_key_header = "X-API-Key";\n'
+                    'const tokenEndpoint = "https://auth.exemplo.com/oauth2/v2/token";\n'
+                    'const apiKey = process.env.API_KEY;\nconst secret = "${SECRET_1234567}";\n'
+                    'const db = "postgres' + '://postgres:postgres@localhost:5432/dev";\n')
+        with open(os.path.join(site, "LEIAME.md"), "w") as f:
+            f.write('Crie o arquivo com `senha = "exemplo123456"` e `token: "seu-token-aqui-123"`.\n')
+        run(site, "git", "add", ".env.example", "app.js", "LEIAME.md")
+        ok(d("git commit -m x", site) is None, "código comum de site não é segredo: %r" % (d("git commit -m x", site),))
+        run(site, "git", "commit", "-qm", "site")
+        with open(os.path.join(site, ".env.example"), "w") as f:
+            f.write("CHAVE=" + "AKIA" + "ABCDEFGHIJKLMNOP" + "\n")
+        run(site, "git", "add", ".env.example")
+        ok(tipo("git commit -m x", site) == "deny", "chave de verdade num .env.example ainda nega")
+        run(site, "git", "checkout", "-q", "HEAD", "--", ".env.example")
+
+        # cada exclusão do palpite, isolada (uma por vez, para nenhuma se esconder atrás da outra)
+        pal = segredos_no_texto
+        ok(pal('password: "ContraseñaSegura"') == [], "valor sem número não é segredo")
+        ok(pal('tokenEndpoint = "https://auth.minhaloja.com/oauth2/v2/token"') == [], "URL não é segredo")
+        ok(pal('api_key_path = "/etc/chaves/v2/arquivo9"') == [], "caminho não é segredo")
+        ok(pal('token = "${TOKEN_DA_API_2}"') == [], "variável não é segredo")
+        ok(pal("DB = 'postgres" + "://app:Xk29fjq0Lm@localhost:5432/dev'") == [], "banco local não é segredo")
+        ok(pal("DB = 'postgres" + "://app:password@db.minhaloja.com/x'") == [], "senha de exemplo não é segredo")
+        ok(pal("sen" + 'ha = "Xk29fjq0Lm3p"') != [], "controle: senha de verdade no molde é segredo")
+        ok(pal("DB = 'postgres" + "://app:Xk29fjq0Lm@db.minhaloja.com/x'") != [], "controle: conexão de verdade é segredo")
+        ok(pal("sen" + 'ha = "Xk29fjq0Lm3p"', so_fortes=True) == [], "em arquivo de exemplo o palpite não vale")
+        with open(os.path.join(site, ".env.example"), "w") as f:
+            f.write("API_" + 'KEY="Xk29fjq0Lm3pQ7"\n')
+        run(site, "git", "add", ".env.example")
+        ok(d("git commit -m x", site) is None, "valor com cara de senha num .env.example passa (é exemplo)")
+        run(site, "git", "checkout", "-q", "HEAD", "--", ".env.example")
+
+        # add por caminho na mesma chamada: só o que o add leva é examinado
+        with open(os.path.join(site, ".env"), "w") as f:
+            f.write("X=1\n")
+        with open(os.path.join(site, "novo.js"), "w") as f:
+            f.write("console.log(1)\n")
+        ok(d("git add novo.js && git commit -m x", site) is None,
+           ".env solto não barra commit que não o leva: %r" % (d("git add novo.js && git commit -m x", site),))
+        ok(tipo("git add . && git commit -m x", site) == "deny", "mas `add .` com .env solto nega")
+        ok(tipo("git add .env novo.js && git commit -m x", site) == "deny", "e add do próprio .env nega")
+        ok(d("git commit -am x", site) is None, "commit -a não leva arquivo novo: .env solto não barra")
+        os.remove(os.path.join(site, ".env"))
+        os.remove(os.path.join(site, "novo.js"))
+
+        # Montados por pedaços: se estivessem inteiros aqui, a guarda negaria o commit dela mesma.
+        for rotulo, texto in (("string de conexão", "DB = 'postgres:" + "//app:s3nh4forte@db.exemplo.com/x'"),
+                              ("senha escrita", "sen" + 'ha = "c0rreto-cavalo-bateria"'),
+                              ("chave privada", "-----BEGIN OPENSSH PRIVATE" + " KEY-----"),
+                              ("token do GitHub", "t = ghp_" + "A1b2" * 9)):
+            with open(os.path.join(site, "x.py"), "w") as f:
+                f.write(texto + "\n")
+            run(site, "git", "add", "x.py")
+            ok(tipo("git commit -m x", site) == "deny", "devia negar %s" % rotulo)
+            run(site, "git", "rm", "-q", "-f", "--cached", "x.py")
+        os.remove(os.path.join(site, "x.py"))
+        ok(d("git commit -m x", site) is None, "árvore limpa de novo passa")
+
+        # -- o hook de verdade, pelo stdin
+        def hook(payload, *args, entrada=None):
+            r = subprocess.run([sys.executable, __file__, *args], capture_output=True, text=True, timeout=20,
+                               input=entrada if entrada is not None else json.dumps(payload))
+            return r.returncode, r.stdout
+        rc, out = hook({"tool_name": "Bash", "cwd": tmp, "tool_input": {"command": "git push --force"}})
+        ok(rc == 0 and json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny", "hook nega: %r" % out)
+        rc, out = hook({"tool_name": "Bash", "cwd": tmp, "tool_input": {"command": "ls"}})
+        ok(rc == 0 and out == "", "inofensivo: sai calado")
+        for lixo in ("", "{isto não é json", "[1, 2]", '{"tool_input": null}'):
+            rc, out = hook(None, entrada=lixo)
+            ok(rc == 0 and out == "", "entrada ilegível nunca bloqueia: %r" % lixo)
+
+        # -- fora da raiz
+        marcas = os.path.join(tmp, "marcas")
+        os.makedirs(marcas)
+        with open(os.path.join(raiz, "CLAUDE.md"), "w") as f:
+            f.write("# x\n\n## Segurança e git\n\n- regra de push\n\n## Outra\n\n- y\n")
+        with open(os.path.join(raiz, "brain", "notas", "projetos", "site-loja.md"), "w") as f:
+            f.write("x")
+        fora = lambda sid, cwd, evento="SessionStart", prompt="": modo_fora(
+            {"session_id": sid, "cwd": cwd, "hook_event_name": evento, "prompt": prompt}, raiz=raiz, marcas=marcas)
+        ok(fora("a", raiz) is None, "na raiz: calado")
+        r = fora("b", site)
+        ok(r and "regra de push" in r["hookSpecificOutput"]["additionalContext"], "subpasta do OS: avisa com as regras")
+        ok(fora("b", site) is None, "uma vez por sessão")
+        ok(fora("c", tmp) is None, "fora do OS e sem assunto do OS: calado")
+        ok(fora("d", tmp, "UserPromptSubmit", "arruma o banner do site-loja") is not None, "fora, citando projeto: avisa")
+        ok(fora("e", tmp, "UserPromptSubmit", "que horas são?") is None, "fora, outro assunto: calado")
+        print("guarda selftest ok — %d asserts" % n)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        main()

@@ -1,0 +1,150 @@
+#!/bin/bash
+# nota [termo …] [--dominio=D] [--dominio-diferente-de=D] [--forma=F] [--status=S]
+#   Busca ranqueada nas notas de brain/notas/**. Camada 1: título+frontmatter
+#   (título ×2, dominio/forma ×1), ordenado por score, empate por mtime.
+#   Camada 2 (só se a 1 zerar e houver termos): full-text no corpo, filtros
+#   de frontmatter ainda valem, sufixo " [full-text]". Exit 1 sem match.
+#   NUNCA varre brain/privado/ nem arquivo/. --selftest embutido.
+set -u
+SELF="$(cd "$(dirname "$0")" && pwd)"
+ROOT="${OS_ROOT:-$(cd "$SELF/../.." && pwd)}"
+exec python3 - "$ROOT" "$@" <<'PY'
+import os
+import re
+import sys
+
+ROOT = sys.argv[1]
+ARGS = sys.argv[2:]
+
+
+def parse_args(args):
+    termos, filtros = [], {"dominio": None, "dominio_neq": None, "forma": None, "status": None}
+    for a in args:
+        if a.startswith("--dominio-diferente-de="):
+            filtros["dominio_neq"] = a.split("=", 1)[1].lower()
+        elif a.startswith("--dominio="):
+            filtros["dominio"] = a.split("=", 1)[1].lower()
+        elif a.startswith("--forma="):
+            filtros["forma"] = a.split("=", 1)[1].lower()
+        elif a.startswith("--status="):
+            filtros["status"] = a.split("=", 1)[1].lower()
+        elif a.startswith("--"):
+            print(f"nota: flag desconhecida: {a}", file=sys.stderr)
+            sys.exit(2)
+        else:
+            termos.append(a.lower())
+    return termos, filtros
+
+
+def lista(fm, campo_nome):
+    m = re.search(rf"^{campo_nome}:\s*(.+)$", fm, re.M)
+    if not m:
+        return []
+    v = m.group(1).strip()
+    v = v[1:-1] if v.startswith("[") and v.endswith("]") else v
+    return [x.strip().strip("'\"").lower() for x in v.split(",") if x.strip()]
+
+
+def escalar(fm, campo_nome):
+    m = re.search(rf"^{campo_nome}:\s*(.+)$", fm, re.M)
+    return m.group(1).strip().strip("'\"").lower() if m else ""
+
+
+def carrega(root):
+    """[(path, titulo, dominios, formas, status, corpo_lower, mtime)]"""
+    notas_dir = os.path.join(root, "brain", "notas")
+    out = []
+    for base, dirs, files in os.walk(notas_dir):
+        dirs[:] = [d for d in dirs if d not in ("privado", "arquivo")]
+        for fn in sorted(files):
+            if not fn.endswith(".md"):
+                continue
+            p = os.path.join(base, fn)
+            with open(p, encoding="utf-8") as fh:
+                texto = fh.read()
+            m = re.match(r"^---\n(.*?)\n---", texto, re.S)
+            fm = m.group(1) if m else ""
+            tt = re.search(r"^#\s+(.+)$", texto, re.M)
+            titulo = tt.group(1).strip() if tt else fn[:-3]
+            out.append((p, titulo, lista(fm, "dominio"), lista(fm, "forma"),
+                        escalar(fm, "status"), texto.lower(), os.path.getmtime(p)))
+    return out
+
+
+def filtra(nota, filtros):
+    _p, _t, dom, forma, status, _c, _mt = nota
+    if filtros["dominio"] and filtros["dominio"] not in dom:
+        return False
+    if filtros["dominio_neq"] and (filtros["dominio_neq"] in dom or not dom):
+        return False
+    if filtros["forma"] and filtros["forma"] not in forma:
+        return False
+    if filtros["status"] and status != filtros["status"]:
+        return False
+    return True
+
+
+def buscar(root, termos, filtros):
+    """[(score, mtime, path, titulo, camada)]"""
+    notas = [n for n in carrega(root) if filtra(n, filtros)]
+    resultados = []
+    for p, titulo, dom, forma, _st, _corpo, mt in notas:
+        alvo_t = titulo.lower()
+        alvo_df = " ".join(dom) + " " + " ".join(forma)
+        if all(t in alvo_t or t in alvo_df for t in termos):
+            score = sum((2 if t in alvo_t else 0) + (1 if t in alvo_df else 0) for t in termos)
+            resultados.append((score, mt, p, titulo, 1))
+    if resultados or not termos:
+        return resultados
+    for p, titulo, _d, _f, _st, corpo, mt in notas:
+        if all(t in corpo for t in termos):
+            resultados.append((sum(corpo.count(t) for t in termos), mt, p, titulo, 2))
+    return resultados
+
+
+def _selftest():
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        nd = os.path.join(d, "brain", "notas")
+        os.makedirs(nd)
+        os.makedirs(os.path.join(nd, "privado"))
+        with open(os.path.join(nd, "privado", "segredo.md"), "w") as f:
+            f.write("# gargalo secreto\n")
+        with open(os.path.join(nd, "a.md"), "w") as f:
+            f.write("---\ntipo: conhecimento\ndominio: [industria]\nforma: [gargalo-de-capacidade]\n"
+                    "criado: 2026-01-01\nstatus: ativa\n---\n# O gargalo da fábrica\ncorpo\n")
+        with open(os.path.join(nd, "b.md"), "w") as f:
+            f.write("---\ntipo: conhecimento\ndominio: [saude]\nforma: [gargalo-de-decisao]\n"
+                    "criado: 2026-01-01\nstatus: semente\n---\n# Outra coisa\nfala de gargalo no corpo\n")
+        rs = buscar(d, ["gargalo"], {"dominio": None, "dominio_neq": None, "forma": None, "status": None})
+        ordem = [os.path.basename(r[2]) for r in sorted(rs, key=lambda r: (-r[0], -r[1]))]
+        assert ordem == ["a.md", "b.md"], ordem            # título ×2 > forma ×1
+        assert all("segredo" not in r[2] for r in rs)      # privado/ nunca entra
+        rs2 = buscar(d, ["corpo"], {"dominio": None, "dominio_neq": None, "forma": None, "status": None})
+        assert rs2 and all(r[4] == 2 for r in rs2), rs2    # fallback full-text
+        rs3 = buscar(d, ["gargalo"], {"dominio": "saude", "dominio_neq": None, "forma": None, "status": None})
+        assert [os.path.basename(r[2]) for r in rs3] == ["b.md"], rs3
+        rs4 = buscar(d, [], {"dominio": None, "dominio_neq": "industria", "forma": None, "status": None})
+        assert [os.path.basename(r[2]) for r in rs4] == ["b.md"], rs4
+        print("nota selftest ok")
+    finally:
+        shutil.rmtree(d)
+
+
+if ARGS and ARGS[0] == "--selftest":
+    _selftest()
+    sys.exit(0)
+termos, filtros = parse_args(ARGS)
+if not (termos or any(filtros.values())):
+    print("uso: nota [termo …] [--dominio=D] [--dominio-diferente-de=D] "
+          "[--forma=F] [--status=S]", file=sys.stderr)
+    sys.exit(2)
+rs = buscar(ROOT, termos, filtros)
+if not rs:
+    sys.exit(1)
+for score, _mt, p, titulo, camada in sorted(rs, key=lambda r: (-r[0], -r[1])):
+    print(f"{p} — {titulo}" + ("" if camada == 1 else " [full-text]"))
+sys.exit(0)
+PY

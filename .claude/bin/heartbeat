@@ -1,0 +1,88 @@
+#!/bin/bash
+# heartbeat — gatilho do ritual na abertura da sessão (hook SessionStart).
+# Substitui o daemon que o TCC nunca deixou rodar: a sessão abre no Terminal
+# autorizado, então o lembrete acontece com o dono presente. Imprime só o
+# que está vencido; silêncio = tudo em dia. NUNCA sai com !=0.
+set -u
+SELF="$(cd "$(dirname "$0")" && pwd)"
+ROOT="${OS_ROOT:-$(cd "$SELF/../.." && pwd)}"
+exec python3 - "$ROOT" "$SELF" <<'PY'
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+ROOT = sys.argv[1]
+sys.path.insert(0, sys.argv[2])  # oslib mora ao lado deste script; OS_ROOT sobrepõe só os dados inspecionados
+try:
+    import oslib
+except Exception:
+    sys.exit(0)
+
+hoje = datetime.date.today()
+avisos = []
+
+# 1. Destilação pendente (dono da lógica: oslib, a mesma do check 11 do doctor)
+try:
+    n = len(oslib.autocommits_sem_fim(ROOT))
+    if n:
+        avisos.append(f"{n} auto-commit(s) sem /fim — rode /destilar")
+except Exception:
+    pass
+
+# 2. Retrospectiva semanal
+try:
+    retro = oslib.retro_devida(ROOT)
+    if retro:
+        avisos.append(f"{retro} — rode /retrospectiva")
+except Exception:
+    pass
+
+# 3. /melhoria quinzenal (cadência sem daemon)
+try:
+    stamp_p = os.path.join(ROOT, ".claude", "melhoria", "last-analysis")
+    ledger_p = os.path.join(ROOT, ".claude", "melhoria", "ledger.jsonl")
+    if os.path.isfile(ledger_p) and not os.path.isfile(stamp_p):
+        with open(ledger_p, encoding="utf-8") as f:
+            sessoes = sum(1 for l in f if l.strip())
+        if sessoes >= 20:                 # primeira análise: só cobra com material para analisar
+            avisos.append(f"análise de melhoria nunca feita, {sessoes} sessão(ões) no ledger — rode /melhoria")
+    elif os.path.isfile(ledger_p):
+        with open(stamp_p, encoding="utf-8") as f:
+            stamp = f.read().strip()
+        idade = (hoje - datetime.date.fromisoformat(stamp[:10])).days
+        if idade >= 14:
+            novas = 0
+            with open(ledger_p, encoding="utf-8") as f:
+                for l in f:
+                    try:
+                        if (json.loads(l).get("ts_end") or "") > stamp:
+                            novas += 1
+                    except Exception:
+                        continue
+            if novas:
+                avisos.append(f"análise de melhoria há {idade}d, {novas} sessão(ões) novas — rode /melhoria")
+except Exception:
+    pass
+
+# 4. Índice de memórias divergente
+try:
+    sem_linha, quebrados = oslib.indice_memorias(ROOT)
+    if sem_linha or quebrados:
+        avisos.append("índice de memórias divergente — rode .claude/bin/doctor")
+except Exception:
+    pass
+
+# 5. Radar (resumo; 0 linhas quando quieto)
+try:
+    r = subprocess.run([os.path.join(ROOT, ".claude", "bin", "radar"), "--resumo"],
+                       capture_output=True, text=True, timeout=8)
+    avisos.extend(r.stdout.strip().splitlines()[:3])
+except Exception:
+    pass
+
+for a in avisos:
+    print(f"heartbeat: {a}")
+sys.exit(0)
+PY

@@ -1,0 +1,186 @@
+#!/bin/bash
+# memoria — busca ranqueada nas memórias de brain/memoria/.
+#   Camada 1: frontmatter (name ×2, description ×1), ordenado por score, empate
+#   por mtime. Camada 2 (só se a 1 zerar): full-text no corpo, com sufixo
+#   " [full-text]". Exit 1 sem match em nenhuma camada. --selftest embutido.
+set -u
+SELF="$(cd "$(dirname "$0")" && pwd)"
+ROOT="${OS_ROOT:-$(cd "$SELF/../.." && pwd)}"
+# 3<&0 guarda o stdin ORIGINAL no fd 3 antes de o heredoc ocupar o fd 0: é por ele que
+# `memoria add` lê o corpo. Sem isso o Python lia o próprio programa como stdin e o
+# corpo sumia.
+exec python3 - "$ROOT" "$@" 3<&0 <<'PY'
+import os
+import re
+import sys
+
+ROOT = sys.argv[1]
+ARGS = sys.argv[2:]
+
+
+def frontmatter(texto):
+    m = re.match(r"^---\n(.*?)\n---", texto, re.S)
+    return m.group(1) if m else ""
+
+
+def campo(fm, nome):
+    m = re.search(rf"^{nome}:\s*(.+)$", fm, re.M)
+    return m.group(1).strip().strip("'\"") if m else ""
+
+
+def buscar(root, termos):
+    """[(score, mtime, path, description, camada)] — camada 1, senão camada 2."""
+    d = os.path.join(root, "brain", "memoria")
+    arquivos = sorted(f for f in os.listdir(d) if f.endswith(".md") and f != "MEMORY.md")
+    corpos, resultados = {}, []
+    for fn in arquivos:
+        p = os.path.join(d, fn)
+        with open(p, encoding="utf-8") as f:
+            texto = f.read()
+        corpos[p] = texto
+        fm = frontmatter(texto)
+        name = campo(fm, "name").lower()
+        desc = campo(fm, "description")
+        if all(t in name or t in desc.lower() for t in termos):
+            score = sum((2 if t in name else 0) + (1 if t in desc.lower() else 0) for t in termos)
+            resultados.append((score, os.path.getmtime(p), p, desc or "(sem description)", 1))
+    if resultados:
+        return resultados
+    for p, texto in corpos.items():
+        baixo = texto.lower()
+        if all(t in baixo for t in termos):
+            desc = campo(frontmatter(texto), "description") or "(sem description)"
+            resultados.append((sum(baixo.count(t) for t in termos),
+                               os.path.getmtime(p), p, desc, 2))
+    return resultados
+
+
+def modo_busca(termos):
+    rs = buscar(ROOT, [t.lower() for t in termos])
+    if not rs:
+        sys.exit(1)
+    for score, _mt, p, desc, camada in sorted(rs, key=lambda r: (-r[0], -r[1])):
+        print(f"{p} — {desc}" + ("" if camada == 1 else " [full-text]"))
+    sys.exit(0)
+
+
+SLUG_RX = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def corpo_do_stdin():
+    """Corpo opcional do `add`: vem pelo fd 3 (cópia do stdin original feita pelo
+    wrapper), porque o fd 0 do Python é o próprio programa. Nunca bloqueia: lê
+    arquivo regular (heredoc) e dispositivo (/dev/null) direto; pipe só se já tiver
+    dado ou EOF em 0,5 s — pipe aberto sem escritor ativo conta como "sem corpo".
+    Vazio se for tty ou se o fd não existir."""
+    import select
+    import stat
+    try:
+        if os.isatty(3):
+            return ""
+        st = os.fstat(3)
+        if not stat.S_ISREG(st.st_mode):  # pipe, socket, dispositivo: só lê se já houver dado ou EOF
+            pronto, _w, _x = select.select([3], [], [], 0.5)
+            if not pronto:
+                return ""
+        with os.fdopen(3, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def modo_add(slug, titulo, gancho, corpo=None):
+    d = os.path.join(ROOT, "brain", "memoria")
+    destino = os.path.join(d, f"{slug}.md")
+    indice = os.path.join(d, "MEMORY.md")
+    if not SLUG_RX.match(slug):
+        print(f"memoria add: slug inválido (kebab-case): {slug!r}", file=sys.stderr)
+        sys.exit(2)
+    if os.path.exists(destino):
+        print(f"memoria add: já existe: {destino}", file=sys.stderr)
+        sys.exit(2)
+    if not os.path.isfile(indice):
+        print(f"memoria add: MEMORY.md ausente em {d}", file=sys.stderr)
+        sys.exit(2)
+    if corpo is None:
+        corpo = corpo_do_stdin()
+    with open(destino, "w", encoding="utf-8") as f:
+        f.write(f"---\nname: {slug}\ndescription: {gancho}\n---\n\n"
+                + (corpo + "\n" if corpo else ""))
+    try:
+        with open(indice, "a", encoding="utf-8") as f:
+            f.write(f"- [{titulo}]({slug}.md) — {gancho}\n")
+    except Exception:
+        os.unlink(destino)  # ou os dois, ou nenhum — o índice nunca diverge
+        raise
+    print(destino)
+
+
+def _selftest():
+    import shutil
+    import tempfile
+    global ROOT
+    d = tempfile.mkdtemp()
+    ROOT = d
+    try:
+        md = os.path.join(d, "brain", "memoria")
+        os.makedirs(md)
+        with open(os.path.join(md, "MEMORY.md"), "w") as f:
+            f.write("# MEMORY\n")
+        with open(os.path.join(md, "gato-no-name.md"), "w") as f:
+            f.write("---\nname: gato-no-name\ndescription: outra coisa\n---\ncorpo\n")
+        with open(os.path.join(md, "so-na-descricao.md"), "w") as f:
+            f.write("---\nname: so-na-descricao\ndescription: fala de gato aqui\n---\ncorpo\n")
+        with open(os.path.join(md, "so-no-corpo.md"), "w") as f:
+            f.write("---\nname: so-no-corpo\ndescription: nada\n---\no cachorro late\n")
+        rs = buscar(d, ["gato"])
+        assert [os.path.basename(r[2]) for r in sorted(rs, key=lambda r: (-r[0], -r[1]))] == \
+            ["gato-no-name.md", "so-na-descricao.md"], rs        # name ×2 vence
+        assert all(r[4] == 1 for r in rs), rs
+        rs2 = buscar(d, ["cachorro"])
+        assert len(rs2) == 1 and rs2[0][4] == 2, rs2             # fallback full-text
+        assert buscar(d, ["inexistente"]) == []
+        # add atômico: arquivo + linha no índice
+        modo_add("nova-memoria", "Nova memória", "gancho de teste", corpo="fato provado")
+        p = os.path.join(md, "nova-memoria.md")
+        assert os.path.isfile(p)
+        idx = open(os.path.join(md, "MEMORY.md"), encoding="utf-8").read()
+        assert "- [Nova memória](nova-memoria.md) — gancho de teste" in idx, idx
+        assert "fato provado" in open(p, encoding="utf-8").read()
+        # slug duplicado e slug inválido: exit 2, nada escrito
+        for ruim in [("nova-memoria", "T", "g"), ("Maiuscula!", "T", "g")]:
+            try:
+                modo_add(*ruim, corpo="x")
+                assert False, f"devia ter recusado {ruim}"
+            except SystemExit as e:
+                assert e.code == 2, e.code
+        # corpo via stdin pelo CLI de verdade (o wrapper): o programa não pode ocupar o stdin.
+        # Sem isso a memória nasce só com frontmatter.
+        import subprocess
+        cli = os.path.join(sys.argv[1], ".claude", "bin", "memoria")
+        r = subprocess.run([cli, "add", "via-stdin", "Via stdin", "gancho stdin"],
+                           input="corpo que veio pelo stdin\n", text=True, capture_output=True,
+                           env={**os.environ, "OS_ROOT": d}, timeout=30)
+        assert r.returncode == 0, r.stderr
+        assert "corpo que veio pelo stdin" in open(os.path.join(md, "via-stdin.md"), encoding="utf-8").read(), \
+            "corpo via stdin perdido — o wrapper entregou o stdin ao programa, não ao add"
+        print("memoria selftest ok")
+    finally:
+        shutil.rmtree(d)
+
+
+if ARGS and ARGS[0] == "--selftest":
+    _selftest()
+elif ARGS and ARGS[0] == "add":
+    if len(ARGS) != 4:
+        print('uso: memoria add <slug> "<Título>" "<gancho>"  (corpo opcional via stdin)',
+              file=sys.stderr)
+        sys.exit(2)
+    modo_add(ARGS[1], ARGS[2], ARGS[3])
+elif not ARGS:
+    print("uso: memoria <termo> [termo2 …]  |  memoria add <slug> \"<Título>\" \"<gancho>\"",
+          file=sys.stderr)
+    sys.exit(2)
+else:
+    modo_busca(ARGS)
+PY
