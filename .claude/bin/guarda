@@ -79,7 +79,7 @@ LEITURA = {"status", "log", "diff", "show", "rev-parse", "rev-list", "ls-files",
            "blame", "shortlog", "cat-file", "grep", "for-each-ref", "help", "version"}
 # Opções globais do git que a guarda conhece e que não levam valor separado. Qualquer outra antes do
 # subcomando pergunta: uma opção desconhecida com valor faria o valor passar por subcomando.
-GLOBAIS = {"--no-pager", "-p", "-P", "--paginate", "--bare", "--no-replace-objects", "--literal-pathspecs",
+GLOBAIS = {"--no-pager", "-p", "-P", "--paginate", "--no-replace-objects", "--literal-pathspecs",
            "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks", "--no-lazy-fetch",
            "--no-advice", "--version", "-v", "--help", "-h", "--html-path", "--man-path", "--info-path"}
 POR_EXTENSO = ("A guarda não segue apelido nem configuração que mude o que o git faz: seguir é interpretar, e é "
@@ -289,8 +289,8 @@ def gits(cmd, cwd, home):
             elif o in ("--git-dir", "--work-tree", "--namespace") and i + 1 < len(p):
                 extra["desvio"] = True
                 i += 2
-            elif o.startswith(("--git-dir=", "--work-tree=", "--namespace=")):
-                extra["desvio"] = True
+            elif o == "--bare" or o.startswith(("--git-dir=", "--work-tree=", "--namespace=")):
+                extra["desvio"] = True                  # `--bare` trata a pasta atual como o próprio .git
                 i += 1
             elif o.startswith("--config-env"):
                 extra["config_env"] = True
@@ -1447,6 +1447,11 @@ def _selftest():
             ok(r and r[0] == "deny" and "examinar" in r[1], "commit com repositório desviado nega: %r → %r" % (cmd, r))
         ok(tipo("git --git-dir=%s --work-tree=%s add app2.js" % (gd, br), tmp) == "ask", "add com repositório desviado pergunta")
         ok(d("git --git-dir=%s log --oneline" % gd, tmp) is None, "leitura com --git-dir passa")
+        # `--bare` também troca o repositório (trata a pasta atual como o .git): mesma regra
+        r = d("git --bare commit -m x", gd)
+        ok(r and r[0] == "deny" and "examinar" in r[1], "commit com --bare nega: %r" % (r,))
+        ok(tipo("git --bare add app2.js", gd) == "ask", "add com --bare pergunta")
+        ok(d("git --bare log --oneline", gd) is None, "leitura com --bare passa")
         run(br, "git", "reset", "-q", "--hard", "HEAD")
         # -- texto em UTF-16 SEM marca no começo (parece binário): a chave ainda é achada
         for nome_u, dados_u in (("le.txt", ("x = " + chave2 + "\n").encode("utf-16-le")),
