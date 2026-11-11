@@ -45,8 +45,11 @@ RAIZ = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # ---- o que sai da máquina e não volta: PERGUNTA ---------------------------------
 PUSH = ("git push", "O código sai desta máquina. Onde há publicação automática, o site muda sozinho.")
-# `git push` chamado por dentro de outro comando (`bash -c "git push"`, `xargs git push`).
-PUSH_INDIRETO = re.compile(r"\bgit\s+(?:-\S+\s+\S+\s+)*push\b")
+# `git … push` por dentro de OUTRO comando (`bash -c "git push"`, `xargs git push`): ali não dá para
+# separar opção de valor, então basta as duas palavras no mesmo comando. Pergunta a mais não custa.
+PUSH_INDIRETO = re.compile(r"\bgit\b.*\bpush\b", re.S)
+# Subcomandos em que a palavra solta `push` é argumento comum, e não o push.
+PUSH_E_ARGUMENTO = {"stash", "help"}
 SAI_DA_MAQUINA = [
     (r"\bvercel\b[^|;&\n]*--prod\b", "publicação em produção (Vercel)",
      "O site no ar passa a servir este código imediatamente."),
@@ -92,9 +95,9 @@ LOCAL = {"localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal", "db", "dat
 NOME_PERMITIDO = re.compile(r"\.env\.(?:example|exemplo|sample|template|modelo)$", re.I)
 NOME_SEGREDO = re.compile(r"(?:^|/)(?:\.env(?:\.[^/]*)?|[^/]*\.env|[^/]*\.pem|[^/]*\.p12|[^/]*\.pfx|"
                           r"[^/]*\.key|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]*\.ovpn)$", re.I)
-TETO_ARQUIVO = 256_000        # arquivo sem rastreio maior que isso não é lido (não é código escrito à mão)
-TETO_ARQUIVOS = 200
-PRAZO = 5.0                   # segundos para a varredura inteira; o hook tem 20
+TETO_ARQUIVOS = 1000          # arquivos novos examinados por commit; acima disso, o commit vai em partes
+PRAZO = 10.0                  # segundos para o exame inteiro (git incluído); o hook tem 20
+PEDACO = 4000                 # linha comprida (código minificado) é examinada em pedaços, com sobra
 
 ATRIBUICAO = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 PREFIXO = {"then", "do", "else", "env", "command", "exec", "time", "nohup", "sudo", "{", "}", "!"}
@@ -171,9 +174,8 @@ def comandos(cmd, cwd, home):
     return saida
 
 
-def chamadas_git(cmd, cwd, home=None):
-    """[(pasta, subcomando, argumentos)] de cada `git` do comando; a pasta segue `cd` e `-C`."""
-    home = home or os.path.expanduser("~")
+def gits(cmd, cwd, home):
+    """[(pasta, subcomando, argumentos, palavras)] de cada `git` do comando; a pasta segue `cd` e `-C`."""
     saida = []
     for atual, p in comandos(cmd, cwd, home):
         if os.path.basename(p[0]) != "git":
@@ -188,8 +190,32 @@ def chamadas_git(cmd, cwd, home=None):
             else:
                 i += 1
         if i < len(p):
-            saida.append((pasta, p[i], p[i + 1:]))
+            saida.append((pasta, p[i], p[i + 1:], p))
     return saida
+
+
+def chamadas_git(cmd, cwd, home=None):
+    """[(pasta, subcomando, argumentos)] — a mesma leitura, sem as palavras cruas."""
+    return [g[:3] for g in gits(cmd, cwd, home or os.path.expanduser("~"))]
+
+
+def palavras_do_push(pasta, sub, p):
+    """Se este `git` é (ou pode ser) um push: as palavras a examinar atrás de opção de força.
+    None se não é. Na dúvida é push: opção global que a leitura não conhece pode ter feito o
+    valor dela passar por subcomando, e apelido (`alias`) pode esconder o push."""
+    resto = p[1:]
+    if sub == "push":
+        return resto
+    if any(a.startswith("alias.") or a.startswith("-calias.") for a in resto) or \
+            any(a.startswith("--config-env") for a in resto):
+        return resto                                   # apelido definido na própria linha
+    if "push" in resto and sub not in PUSH_E_ARGUMENTO:
+        return resto
+    if re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]*$", sub or ""):
+        apelido = _git(pasta, "config", "--get", "alias." + sub)
+        if apelido and re.search(r"\bpush\b", apelido):
+            return resto + _palavras(apelido)
+    return None
 
 
 def _curtas(args):
@@ -237,17 +263,21 @@ def _sem_valores(args):
     return saida
 
 
-def _git(pasta, *args):
+def _git(pasta, *args, prazo=3):
+    """Saída do git, ou None se ele falhou ou estourou o prazo. Quem chama decide o que a falha
+    significa: "sem saída" e "não consegui perguntar" são respostas diferentes. Caminho com
+    acento vem como é (`core.quotepath=off`), e não escapado entre aspas."""
     try:
-        r = subprocess.run(["git", "-C", pasta, *args], capture_output=True, timeout=3)
-        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+        r = subprocess.run(["git", "-C", pasta, "-c", "core.quotepath=off", *args], capture_output=True,
+                           timeout=max(0.5, prazo))
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return None
 
 
 def _topo(pasta):
     """Raiz do repositório git que contém `pasta` (a própria pasta, se não der para saber)."""
-    return _real(_git(pasta, "rev-parse", "--show-toplevel").strip() or pasta)
+    return _real((_git(pasta, "rev-parse", "--show-toplevel") or "").strip() or pasta)
 
 
 def _valor_suspeito(v):
@@ -257,6 +287,13 @@ def _valor_suspeito(v):
 
 
 def segredos_no_texto(texto, so_fortes=False):
+    """Rótulos do que parece segredo. Linha comprida vai em pedaços com sobra: o custo fica
+    proporcional ao tamanho, e nada que caiba na sobra se perde na emenda."""
+    if len(texto) > PEDACO:
+        achados = set()
+        for i in range(0, len(texto), PEDACO - 300):
+            achados.update(segredos_no_texto(texto[i:i + PEDACO], so_fortes))
+        return sorted(achados)
     achados = {rotulo for rotulo, rx in FORTES if rx.search(texto)}
     if not so_fortes:
         if any(_valor_suspeito(m.group(1)) for m in ATRIBUICAO_RX.finditer(texto)):
@@ -269,19 +306,74 @@ def segredos_no_texto(texto, so_fortes=False):
     return sorted(achados)
 
 
+def examinar_arquivo(caminho, nome, fim):
+    """(rótulos, examinou até o fim?) do arquivo inteiro, de qualquer tamanho. Binário (byte nulo
+    no começo, a mesma régua do git) não é lido: segredo mora em texto. Levanta OSError."""
+    so_fortes, achados = bool(NOME_PERMITIDO.search(nome)), set()
+    with open(caminho, "rb") as f:
+        if b"\0" in f.read(8000):
+            return [], True
+        f.seek(0)
+        for bruta in f:
+            if time.monotonic() > fim:
+                return sorted(achados), False
+            achados.update(segredos_no_texto(bruta.decode("utf-8", "replace"), so_fortes))
+    return sorted(achados), True
+
+
+def _arquivos_de(caminho):
+    if os.path.isdir(caminho) and not os.path.islink(caminho):
+        return [os.path.join(d, f) for d, _sub, fs in os.walk(caminho) for f in fs]
+    return [caminho]
+
+
+def segredos_dos_caminhos(pasta, caminhos):
+    """{caminho: [motivos]} entre os caminhos dados (relativos a `pasta`), pelo conteúdo que
+    está no disco. Para quem comita SEM passar pelo hook: script que chama o git por dentro
+    não é visto pela guarda, então pergunta aqui antes de comitar. Não depende do git (nem de
+    como ele escreve nome com acento), e o que não deu para ler até o fim volta como motivo:
+    quem chama não comita o que não foi examinado. A chave é sempre o caminho como foi pedido."""
+    fim, retidos = time.monotonic() + PRAZO, {}
+    for rel in caminhos:
+        motivos = []
+        if NOME_SEGREDO.search(rel) and not NOME_PERMITIDO.search(rel):
+            motivos.append("arquivo de segredo pelo nome")
+        inteiro = os.path.join(pasta, rel)
+        if os.path.lexists(inteiro):                    # apagado não tem o que examinar
+            for arq in _arquivos_de(inteiro):
+                try:
+                    rotulos, completo = examinar_arquivo(arq, arq, fim)
+                except OSError:
+                    rotulos, completo = [], False
+                motivos += [r for r in rotulos if r not in motivos]
+                if not completo and "não deu para examinar por inteiro" not in motivos:
+                    motivos.append("não deu para examinar por inteiro")
+        if motivos:
+            retidos[rel] = motivos
+    return retidos
+
+
 def segredos_do_commit(pasta, rastreados=False, soltos=None):
-    """[(arquivo, o que parece)] do que o commit levaria. Nunca devolve o segredo.
-    Sempre olha o índice. `rastreados`: também o que mudou e ainda não está no índice
-    (`commit -a`, ou `git add` na mesma chamada). `soltos`: lista de caminhos do `git add`
-    da mesma chamada ([] = tudo), para ler também os arquivos novos que ele levaria."""
+    """([(arquivo, o que parece)], [o que não deu para examinar]) do que o commit levaria.
+    Nunca devolve o segredo. Sempre olha o índice. `rastreados`: também o que mudou e ainda não
+    está no índice (`commit -a`, ou `git add` na mesma chamada). `soltos`: caminhos do `git add`
+    da mesma chamada ([] = tudo), para ler também os arquivos novos que ele levaria.
+    Exame que não se completou NÃO é exame limpo: volta na segunda lista, e o commit é negado."""
     fim = time.monotonic() + PRAZO
-    achados = []
+    resta = lambda: fim - time.monotonic()
+    achados, falhas = [], []
+    if _git(pasta, "rev-parse", "--is-inside-work-tree") is None:
+        return [], []                                   # não é repositório: o commit nem acontece
 
     def nome(arq):
         if NOME_SEGREDO.search(arq) and not NOME_PERMITIDO.search(arq):
             achados.append((arq, "arquivo de segredo pelo nome"))
 
-    def diff(texto):
+    def diff(*args):
+        texto = _git(pasta, "diff", *args, "-U0", "--no-color", prazo=resta())
+        if texto is None:
+            falhas.append("o git não respondeu a tempo ao listar as mudanças")
+            return
         arq = "?"
         for linha in texto.splitlines():
             if linha.startswith("+++ "):
@@ -290,69 +382,39 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None):
                 for rotulo in segredos_no_texto(linha[1:], so_fortes=bool(NOME_PERMITIDO.search(arq))):
                     achados.append((arq, rotulo))
 
-    for arq in _git(pasta, "diff", "--cached", "--name-only", "--diff-filter=ACMR").splitlines():
+    nomes = _git(pasta, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", prazo=resta())
+    if nomes is None:
+        falhas.append("o git não respondeu ao listar o que está para comitar")
+    for arq in filter(None, (nomes or "").split("\0")):
         nome(arq)
-    diff(_git(pasta, "diff", "--cached", "-U0", "--no-color"))
+    diff("--cached")
     filtro = ["--", *soltos] if soltos else []
     if rastreados or soltos is not None:
-        diff(_git(pasta, "diff", "-U0", "--no-color", *([] if rastreados else filtro)))
+        diff(*([] if rastreados else filtro))
     if soltos is not None:
         topo = _topo(pasta)
-        novos = _git(pasta, "ls-files", "--others", "--exclude-standard", "--full-name", *filtro).splitlines()
+        lista = _git(pasta, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", *filtro, prazo=resta())
+        if lista is None:
+            falhas.append("o git não respondeu ao listar os arquivos novos")
+        novos = [a for a in (lista or "").split("\0") if a]
+        if len(novos) > TETO_ARQUIVOS:
+            falhas.append("%d arquivos novos de uma vez (examino até %d)" % (len(novos), TETO_ARQUIVOS))
         for arq in novos[:TETO_ARQUIVOS]:
-            if time.monotonic() > fim:
-                break
             nome(arq)
-            caminho = os.path.join(topo, arq)
             try:
-                if os.path.getsize(caminho) > TETO_ARQUIVO:
-                    continue
-                with open(caminho, encoding="utf-8", errors="replace") as f:
-                    for rotulo in segredos_no_texto(f.read(), so_fortes=bool(NOME_PERMITIDO.search(arq))):
-                        achados.append((arq, rotulo))
+                rotulos, completo = examinar_arquivo(os.path.join(topo, arq), arq, fim)
             except OSError:
-                continue
+                rotulos, completo = [], not os.path.lexists(os.path.join(topo, arq))
+            achados.extend((arq, r) for r in rotulos)
+            if not completo:
+                falhas.append("não deu tempo de ler tudo (parei em %s)" % arq)
+                break
     vistos, unicos = set(), []
     for a in achados:
         if a not in vistos:
             vistos.add(a)
             unicos.append(a)
-    return unicos
-
-
-def segredos_dos_caminhos(pasta, caminhos):
-    """{caminho: [o que parece]} entre os caminhos dados (relativos à raiz do repositório), pelo
-    que eles têm de diferente do último commit. Para quem comita SEM passar pelo hook: script
-    que chama o git por dentro não é visto pela guarda, então pergunta aqui antes de comitar."""
-    fim, retidos = time.monotonic() + PRAZO, {}
-    if not caminhos:
-        return retidos
-    for arq in caminhos:
-        if NOME_SEGREDO.search(arq) and not NOME_PERMITIDO.search(arq):
-            retidos.setdefault(arq, []).append("arquivo de segredo pelo nome")
-    arq = None
-    for linha in _git(pasta, "diff", "HEAD", "-U0", "--no-color", "--", *caminhos).splitlines():
-        if linha.startswith("+++ "):
-            arq = linha[6:] if linha.startswith("+++ b/") else linha[4:]
-        elif linha.startswith("+") and arq:
-            for rotulo in segredos_no_texto(linha[1:], so_fortes=bool(NOME_PERMITIDO.search(arq))):
-                if rotulo not in retidos.setdefault(arq, []):
-                    retidos[arq].append(rotulo)
-    topo = _topo(pasta)
-    for arq in _git(pasta, "ls-files", "--others", "--exclude-standard", "--full-name", "--", *caminhos).splitlines():
-        if time.monotonic() > fim:
-            retidos.setdefault(arq, []).append("não deu tempo de examinar")   # na dúvida, não vai
-            continue
-        try:
-            if os.path.getsize(os.path.join(topo, arq)) > TETO_ARQUIVO:
-                continue
-            with open(os.path.join(topo, arq), encoding="utf-8", errors="replace") as f:
-                for rotulo in segredos_no_texto(f.read(), so_fortes=bool(NOME_PERMITIDO.search(arq))):
-                    if rotulo not in retidos.setdefault(arq, []):
-                        retidos[arq].append(rotulo)
-        except OSError:
-            continue
-    return {a: r for a, r in retidos.items() if r}
+    return unicos, falhas
 
 
 def protegidos(raiz, home):
@@ -424,23 +486,27 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
     if rm is not None:
         return ("deny", f"`rm -r` em `{rm[0]}` {rm[1]}.")
 
-    gits = chamadas_git(cmd, cwd, home)
-    for pasta, sub, args in gits:
+    todos = gits(cmd, cwd, home)
+    so3 = [g[:3] for g in todos]
+    for pasta, sub, args, cruas in todos:
         curtas = _curtas(args)
         topo = _topo(pasta)
         na_raiz = topo == raiz_real
-        if sub == "push":
-            if ("--force" in args or "--force-with-lease" in args or "--mirror" in args or "f" in curtas
-                    or any(a.startswith("--force-with-lease=") or a.startswith("--force-if-includes") for a in args)
-                    or any(a.startswith("+") and len(a) > 1 for a in args)):
+        do_push = palavras_do_push(pasta, sub, cruas)
+        if do_push is not None:
+            if ("--force" in do_push or "--force-with-lease" in do_push or "--mirror" in do_push
+                    or "f" in _curtas(do_push)
+                    or any(a.startswith("--force-with-lease=") or a.startswith("--force-if-includes") for a in do_push)
+                    or any(a.startswith("+") and len(a) > 1 for a in do_push)):
                 return ("deny", "Push forçado reescreve o histórico no GitHub e apaga commit que só existe lá. "
                                 "Regra do OS: histórico publicado não se reescreve. Se for mesmo necessário, "
                                 "quem roda é você, no seu terminal.")
-            # Ensaio (`--dry-run`, `-n`) só dispensa a pergunta se for opção DESTE push, antes do `--`:
-            # a palavra solta em outro ponto da linha (`git push; echo --dry-run`) não conta.
-            opcoes = args[:args.index("--")] if "--" in args else args
-            if not ("--dry-run" in opcoes or "n" in _curtas(opcoes)):
-                perguntas.append(PUSH)
+            # Todo push pergunta, o de ensaio (`--dry-run`, `-n`) inclusive. Não há dispensa: distinguir o
+            # `-n` de ensaio do `n` que é valor de outra opção é onde a guarda erraria calada, e uma
+            # pergunta a mais num ensaio não custa nada.
+            perguntas.append(PUSH)
+        if sub == "push":
+            pass
         elif sub == "clean":
             if {"x", "X"} & curtas:
                 return ("deny", "`git clean` com -x apaga o que está FORA do git. Na raiz isso inclui "
@@ -468,12 +534,16 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
             if na_raiz and de_tudo:
                 return ("deny", "No repositório da raiz do OS o commit é sempre POR CAMINHO "
                                 "(`git commit --only -m … -- <caminhos>`). `-a` leva junto o que é de outra sessão.")
-            adds = [a for p, s, a in gits if s == "add" and _topo(p) == topo]
+            adds = [a for p, s, a in so3 if s == "add" and _topo(p) == topo]
             soltos = None
             if adds:
                 soltos = [] if any(add_em_bloco(a, pasta, topo) or not _caminhos(a) for a in adds) else \
                     [c for a in adds for c in _caminhos(a)]
-            achados = segredos_do_commit(pasta, rastreados=de_tudo, soltos=soltos)
+            achados, falhas = segredos_do_commit(pasta, rastreados=de_tudo, soltos=soltos)
+            if not achados and falhas:
+                return ("deny", "Não consegui examinar este commit por inteiro atrás de segredo: "
+                                + "; ".join(falhas[:3]) + ". Commit sem exame não passa. Comite em partes "
+                                "menores: `git add <poucos arquivos>` numa chamada, `git commit` na outra.")
             if achados:
                 lista = "; ".join(f"{arq} ({oque})" for arq, oque in achados[:8])
                 return ("deny", "Este commit levaria segredo para o git: " + lista + ". Regra do OS: segredo "
@@ -596,6 +666,9 @@ def _selftest():
             run(repo, "git", "init", "-q", "-b", "main")
             run(repo, "git", "config", "user.email", "t@t")
             run(repo, "git", "config", "user.name", "t")
+        for repo in (raiz, site):
+            run(repo, "git", "config", "alias.sobe", "push")
+            run(repo, "git", "config", "alias.st", "status -sb")
         d = lambda cmd, cwd=raiz: decidir(cmd, cwd, raiz=raiz, home=home)
         tipo = lambda cmd, cwd=raiz: (d(cmd, cwd) or (None,))[0]
 
@@ -612,7 +685,7 @@ def _selftest():
 
         # -- inofensivos passam em silêncio
         for cmd in ("git status", "git add STATUS.md brain/notas/x.md", "git commit --only -m x -- STATUS.md",
-                    "ls -la", "rm -rf site/node_modules", "rm arquivo.txt", "git push --dry-run",
+                    "ls -la", "rm -rf site/node_modules", "rm arquivo.txt",
                     "git log --oneline -5", "grep -rn push .", "git diff --stat"):
             ok(d(cmd) is None, "devia passar: %r → %r" % (cmd, d(cmd)))
 
@@ -627,9 +700,18 @@ def _selftest():
                     "git push origin main # --dry-run", "git push -- --dry-run", "git push; git push --dry-run",
                     "bash -c 'git push origin main'", "xargs git push"):
             ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
+        # todo push pergunta, ensaio inclusive: adivinhar qual `-n` é ensaio e qual é valor de outra
+        # opção (`-onightly`, `-o --dry-run`) é onde a guarda erraria calada
         for cmd in ("git push -n", "git push --dry-run origin main", "git -C site push --dry-run",
-                    "git commit --only -m 'prepara o push de amanhã' -- STATUS.md", "git log --grep push",
-                    "git stash push -m x"):
+                    "git push -onightly", "git push -o --dry-run origin main", "git push --repo=x -o n",
+                    "xargs git --no-pager push", "bash -c 'git --no-pager push origin main'",
+                    "git --no-pager push", "git -c alias.p=push p", "git -c alias.x=status push",
+                    "git --config-env=x=Y push", "git --exec-path /x push origin main", "git sobe origin main",
+                    "git -C site sobe"):
+            ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
+        for cmd in ("git commit --only -m 'prepara o push de amanhã' -- STATUS.md", "git stash push -m x",
+                    "git help push", "git config push.default simple", "git remote set-url --push origin x",
+                    "git log --oneline", "git st"):
             ok(d(cmd) is None, "devia passar: %r → %r" % (cmd, d(cmd)))
 
         # -- push forçado: nega (todas as grafias)
@@ -785,6 +867,90 @@ def _selftest():
             run(site, "git", "rm", "-q", "-f", "--cached", "x.py")
         os.remove(os.path.join(site, "x.py"))
         ok(d("git commit -m x", site) is None, "árvore limpa de novo passa")
+
+        # -- nome com acento, arquivo grande, binário, git que falha: nada escapa calado
+        chave2 = "sk-" + "ant-" + "Z9y8" * 8
+        os.makedirs(os.path.join(site, "configuração"))
+        with open(os.path.join(site, "configuração", "ação.js"), "w") as f:
+            f.write('const k = "%s";\n' % chave2)
+        with open(os.path.join(site, "grande.js"), "w") as f:
+            f.write("// linha comum\n" * 40000 + 'const k = "%s";\n' % chave2)        # ~600 KB, segredo no fim
+        with open(os.path.join(site, "textura.bin"), "wb") as f:
+            f.write(b"\x00\x01\x02" * 400000 + chave2.encode())                         # binário grande
+        with open(os.path.join(site, "limpo.js"), "w") as f:
+            f.write("console.log('oi')\n")
+        por_caminho = segredos_dos_caminhos(site, ["configuração/ação.js", "grande.js", "textura.bin", "limpo.js",
+                                                   "sumiu.js"])
+        ok(sorted(por_caminho) == ["configuração/ação.js", "grande.js"],
+           "por caminho: acento e arquivo grande são pegos, com a chave IGUAL ao caminho pedido: %r" % (por_caminho,))
+        ok(chave2 not in json.dumps(por_caminho), "por caminho: nunca devolve o valor")
+        # linha comprida (código minificado): o segredo é achado no meio e em cima da emenda dos pedaços
+        ok(segredos_no_texto("a=1;" * 5000 + chave2 + ";b=2;" * 5000) != [], "segredo no meio de linha comprida")
+        ok(segredos_no_texto("x" * (PEDACO - 20) + " " + chave2 + " " + "y" * 9000) != [], "segredo na emenda dos pedaços")
+        # exame que não termina, ou arquivo que não abre: o caminho volta retido, não liberado
+        global PRAZO
+        prazo_de_verdade, PRAZO = PRAZO, -1
+        try:
+            ok(segredos_dos_caminhos(site, ["limpo.js"]) == {"limpo.js": ["não deu para examinar por inteiro"]},
+               "por caminho: sem tempo para examinar, retém")
+        finally:
+            PRAZO = prazo_de_verdade
+        os.chmod(os.path.join(site, "limpo.js"), 0)
+        try:
+            ok("limpo.js" in segredos_dos_caminhos(site, ["limpo.js"]), "por caminho: arquivo que não abre, retém")
+        finally:
+            os.chmod(os.path.join(site, "limpo.js"), 0o644)
+        ok(segredos_dos_caminhos(site, ["limpo.js"]) == {}, "por caminho: controle, o mesmo arquivo limpo passa")
+        ok(tipo("git add configuração && git commit -m x", site) == "deny", "hook: segredo em pasta com acento nega")
+        ok(tipo("git add grande.js && git commit -m x", site) == "deny", "hook: segredo no fim de arquivo grande nega")
+        ok(d("git add textura.bin limpo.js && git commit -m x", site) is None, "hook: binário e arquivo limpo passam")
+        run(site, "git", "add", "-f", "configuração/ação.js")
+        r = d("git commit -m x", site)
+        ok(r and r[0] == "deny" and "configuração/ação.js" in r[1],
+           "hook: segredo em stage com acento nega, e o nome sai legível no motivo: %r" % (r,))
+        run(site, "git", "rm", "-q", "-f", "--cached", "configuração/ação.js")
+        os.makedirs(os.path.join(site, "produção"))
+        with open(os.path.join(site, "produção", ".env"), "w") as f:
+            f.write("X=1\n")
+        run(site, "git", "add", "-f", "produção/.env")
+        r = d("git commit -m x", site)
+        ok(r and r[0] == "deny" and "pelo nome" in r[1], "hook: .env em pasta com acento nega pelo nome: %r" % (r,))
+        run(site, "git", "rm", "-q", "-f", "--cached", "produção/.env")
+        for resto in ("configuração", "produção"):
+            shutil.rmtree(os.path.join(site, resto))
+        for resto in ("grande.js", "textura.bin", "limpo.js"):
+            os.remove(os.path.join(site, resto))
+        # git que falha no meio do exame: o commit não passa sem exame
+        global _git
+        git_de_verdade = _git
+        for nome_f, falha in (("a lista de nomes", lambda a: "--name-only" in a), ("o diff", lambda a: "-U0" in a)):
+            _git = lambda pasta, *a, _f=falha, **k: None if _f(a) else git_de_verdade(pasta, *a, **k)
+            try:
+                r = d("git commit -m x", site)
+                ok(r and r[0] == "deny" and "examinar" in r[1], "git falhou em %s: nega e diz por quê: %r" % (nome_f, r))
+            finally:
+                _git = git_de_verdade
+        _git = lambda pasta, *a, **k: None if a[:1] == ("ls-files",) else git_de_verdade(pasta, *a, **k)
+        try:
+            r = d("git add . && git commit -m x", site)
+            ok(r and r[0] == "deny" and "examinar" in r[1], "git falhou ao listar arquivos novos: nega: %r" % (r,))
+        finally:
+            _git = git_de_verdade
+        ok(d("git commit -m x", os.path.join(tmp, "nao-e-repo")) is None, "fora de repositório não há o que examinar")
+        # arquivos demais para o prazo: nega com instrução, não deixa passar o resto sem olhar
+        global TETO_ARQUIVOS
+        teto_de_verdade, TETO_ARQUIVOS = TETO_ARQUIVOS, 3
+        try:
+            for i in range(5):
+                with open(os.path.join(site, "novo%d.js" % i), "w") as f:
+                    f.write("x\n")
+            r = d("git add . && git commit -m x", site)
+            ok(r and r[0] == "deny" and "partes" in r[1], "arquivos demais: nega pedindo commit em partes: %r" % (r,))
+            ok(d("git add novo0.js novo1.js && git commit -m x", site) is None, "em partes, passa")
+        finally:
+            TETO_ARQUIVOS = teto_de_verdade
+            for i in range(5):
+                os.remove(os.path.join(site, "novo%d.js" % i))
 
         # -- o hook de verdade, pelo stdin
         def hook(payload, *args, entrada=None):
