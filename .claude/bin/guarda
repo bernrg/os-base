@@ -57,19 +57,31 @@ PUSH_E_ARGUMENTO = {"stash", "help"}
 # Variável que aponta o git para outro repositório, pasta ou índice, ou que lhe dá outra configuração.
 # Procurada no texto inteiro do comando, em qualquer forma de atribuição (`X=…`, `export X=…`,
 # `declare -x X=…`, `env X=…`): onde ela foi posta não importa, importa que o git vai obedecer.
-DESVIO_TXT = re.compile(r"\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|"
-                        r"COMMON_DIR|NAMESPACE|CONFIG\w*)=")
+# O NOME basta, com ou sem `=` colado (`export X`, `read X`, `: ${X:=…}`): custa negar um commit cuja
+# mensagem cite o nome, e isso é barato perto de examinar o repositório errado.
+DESVIO_REPO = re.compile(r"\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|"
+                         r"COMMON_DIR|NAMESPACE)\b")
+# Configuração trocada por variável é pior que repositório trocado: pode mandar o git RODAR um programa
+# (paginador, monitor de arquivos, diff externo) até num `git status`. Para ela não há "só leitura".
+DESVIO_CFG = re.compile(r"\bGIT_CONFIG\w*\b")
 # Configuração posta na linha com `-c`. A que muda O QUE o git faz é negada; a de uso comum passa;
 # qualquer outra pergunta. Nomes em minúscula (o git não distingue).
 CFG_NEGADA = ("alias.", "includeif.", "include.")
 CFG_NEGADA_EXATA = {"core.worktree", "core.bare"}
-CFG_CONHECIDA = {"user.name", "user.email", "core.quotepath", "core.pager", "core.editor", "commit.gpgsign",
-                 "tag.gpgsign", "init.defaultbranch", "credential.helper", "core.autocrlf", "pull.rebase",
-                 "gc.auto", "protocol.version", "core.filemode"}
+# Só identidade e aparência. Nada cujo valor seja um programa a rodar (paginador, editor, ajudante de
+# credencial, monitor de arquivos, comando de ssh, diff externo): esses caem em "pergunta".
+CFG_CONHECIDA = {"user.name", "user.email", "core.quotepath", "commit.gpgsign", "tag.gpgsign",
+                 "init.defaultbranch", "core.autocrlf", "pull.rebase", "gc.auto", "protocol.version",
+                 "core.filemode"}
 CFG_CONHECIDA_PREFIXO = ("advice.", "color.")
 # Subcomandos que só leem: com o repositório desviado, não há o que proteger.
 LEITURA = {"status", "log", "diff", "show", "rev-parse", "rev-list", "ls-files", "ls-remote", "describe",
            "blame", "shortlog", "cat-file", "grep", "for-each-ref", "help", "version"}
+# Opções globais do git que a guarda conhece e que não levam valor separado. Qualquer outra antes do
+# subcomando pergunta: uma opção desconhecida com valor faria o valor passar por subcomando.
+GLOBAIS = {"--no-pager", "-p", "-P", "--paginate", "--bare", "--no-replace-objects", "--literal-pathspecs",
+           "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks", "--no-lazy-fetch",
+           "--no-advice", "--version", "-v", "--help", "-h", "--html-path", "--man-path", "--info-path"}
 POR_EXTENSO = ("A guarda não segue apelido nem configuração que mude o que o git faz: seguir é interpretar, e é "
                "aí que ela erraria calada. Escreva o comando do git por extenso (`git commit …`, `git push …`).")
 SAI_DA_MAQUINA = [
@@ -214,6 +226,13 @@ def comandos(cmd, cwd, home):
     return saida
 
 
+def carrega_ambiente(cmd, cwd, home):
+    """A linha carrega variáveis de um arquivo (`source x`, `. x`) ou passa a exportar tudo
+    (`set -a`)? O conteúdo do arquivo a guarda não lê."""
+    return any(p[0] in ("source", ".") or (p[0] == "set" and ("-a" in p or "allexport" in p))
+               for _a, p in comandos(cmd, cwd, home))
+
+
 _EMBUTIDOS = None
 
 
@@ -255,7 +274,7 @@ def gits(cmd, cwd, home):
         if os.path.basename(p[0]) != "git":
             continue
         pasta, i = atual, 1
-        extra = {"config": [], "config_env": False, "desvio": False}
+        extra = {"config": [], "config_env": False, "desvio": False, "estranhas": []}
         while i < len(p) and p[i].startswith("-"):
             o = p[i]
             if o == "-C" and i + 1 < len(p):
@@ -277,9 +296,13 @@ def gits(cmd, cwd, home):
                 extra["config_env"] = True
                 i += 1 if "=" in o else 2
             else:
+                if o not in GLOBAIS and not o.startswith("--exec-path="):
+                    extra["estranhas"].append(o)
                 i += 1
         if i < len(p):
             saida.append((pasta, p[i], p[i + 1:], p, extra))
+        elif extra["estranhas"]:
+            saida.append((pasta, "", [], p, extra))    # só opção desconhecida, sem subcomando: ainda assim pergunta
     return saida
 
 
@@ -661,7 +684,8 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
     fim = time.monotonic() + PRAZO          # um prazo só para tudo que esta chamada examinar
     todos = gits(cmd, cwd, home)
     so3 = [g[:3] for g in todos]
-    desviado = bool(DESVIO_TXT.search(cmd))
+    desvio_repo, desvio_cfg = bool(DESVIO_REPO.search(cmd)), bool(DESVIO_CFG.search(cmd))
+    com_ambiente = carrega_ambiente(cmd, cwd, home)
     for pasta, sub, args, cruas, extra in todos:
         curtas = _curtas(args)
         topo = _topo(pasta)
@@ -676,23 +700,33 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
             vale = apelido_de(pasta, sub)
             if vale:
                 return ("deny", "`git %s` é um apelido (vale `%s`). %s" % (sub, vale[:80], POR_EXTENSO))
-            if vale is None:
-                perguntas.append(("comando do git que não reconheço: " + sub,
-                                  "Não consegui confirmar se é um apelido. Confira o que ele faz."))
+            # Nem comando do git, nem apelido confirmado: pode ser o valor de uma opção que a leitura
+            # tomou por subcomando. Não passa calado.
+            perguntas.append(("comando do git que não reconheço: " + sub, "Confira o que ele faz antes de aprovar."))
+        elif not conhecido:
+            perguntas.append(("linha do git que não consegui ler", "Confira o que ela faz antes de aprovar."))
+        if extra["estranhas"]:
+            perguntas.append(("opção do git que não reconheço: " + " ".join(extra["estranhas"])[:60],
+                              "Ela vem antes do subcomando e pode mudar o que o git faz. Confira."))
         estranhas = [k for k in extra["config"]
                      if k not in CFG_CONHECIDA and not k.startswith(CFG_CONHECIDA_PREFIXO)]
         if estranhas:
             perguntas.append(("configuração na linha: " + ", ".join(estranhas),
                               "Muda como o git se comporta só nesta chamada. Confira para quê."))
-        if extra["desvio"] or desviado:
+        if extra["desvio"] or desvio_repo or desvio_cfg:
             if sub == "commit" or not conhecido:
                 return ("deny", "Esta linha aponta o git para outro repositório, outra pasta, outro índice ou outra "
                                 "configuração (`--git-dir`, `--work-tree`, `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG…`). "
                                 "Não consigo examinar o que ela faria, e sem exame não passa. Rode de dentro da "
-                                "pasta do repositório, sem esses desvios.")
-            if sub not in LEITURA:
+                                "pasta do repositório, sem esses desvios. (Se o nome da variável só aparece no texto "
+                                "da mensagem do commit, escreva a mensagem sem ele.)")
+            if desvio_cfg or sub not in LEITURA:
                 perguntas.append(("git com o repositório ou a configuração desviados",
-                                  "A linha aponta o git para outro lugar; confira qual."))
+                                  "A linha aponta o git para outro lugar, ou lhe dá outra configuração; confira."))
+        if com_ambiente and sub == "commit":
+            perguntas.append(("commit na mesma linha em que se carrega um arquivo de ambiente",
+                              "A guarda não lê o arquivo carregado (`source`, `.`, `set -a`); ele pode mudar para "
+                              "onde o commit vai. Confira, ou rode o commit numa chamada separada."))
         if sub in ("commit", "add") and any(a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
                                             for a in args):
             return ("deny", "`--pathspec-from-file` passa os caminhos por um arquivo que a guarda não lê. "
@@ -918,8 +952,13 @@ def _selftest():
             ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
         for cmd in ("git commit --only -m 'prepara o push de amanhã' -- STATUS.md", "git stash push -m x",
                     "git help push", "git config push.default simple", "git remote set-url --push origin x",
-                    "git log --oneline", "git ls-files", "git rev-parse HEAD", "git nao-existe-este-comando"):
+                    "git log --oneline", "git ls-files", "git rev-parse HEAD", "git --no-pager log --oneline",
+                    "git -p log", "git --no-optional-locks status"):
             ok(d(cmd) is None, "devia passar: %r → %r" % (cmd, d(cmd)))
+        # o que a guarda não reconhece (subcomando ou opção global) não passa calado: pergunta
+        for cmd in ("git nao-existe-este-comando", "git --opcao-que-nao-existe status", "git --super-prefix x/ status",
+                    "git --attr-source HEAD status", "git --list-cmds=main"):
+            ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
 
         # -- push forçado: nega (todas as grafias)
         for cmd in ("git push --force", "git push -f origin main", "git push --force-with-lease",
@@ -948,8 +987,11 @@ def _selftest():
         for cmd in ("git -c user.name=Ana -c user.email=ana@exemplo.com log", "git -c core.quotepath=off status",
                     "git -c color.ui=never diff --stat", "git -c advice.detachedHead=false log"):
             ok(d(cmd) is None, "configuração conhecida devia passar: %r → %r" % (cmd, d(cmd)))
-        for cmd in ("git -c core.hooksPath=/x status", "git -c diff.external=x log", "git -cfoo.bar=1 status"):
-            ok(tipo(cmd) == "ask", "configuração desconhecida devia perguntar: %r → %r" % (cmd, d(cmd)))
+        # a lista das conhecidas só tem identidade e aparência: o que manda o git rodar um programa pergunta
+        for cmd in ("git -c core.hooksPath=/x status", "git -c diff.external=x log", "git -cfoo.bar=1 status",
+                    "git -c core.pager=x log", "git -c core.editor=x commit", "git -c credential.helper=x fetch",
+                    "git -c core.fsmonitor=x status", "git -c core.sshCommand=x fetch", "git -c gpg.program=x log"):
+            ok(tipo(cmd) == "ask", "configuração que roda programa ou desconhecida devia perguntar: %r → %r" % (cmd, d(cmd)))
         # lista de caminhos em arquivo: a guarda não lê, então não passa
         for cmd in ("git add --pathspec-from-file=lista.txt", "git commit --pathspec-from-file lista.txt -m x",
                     "git add --pathspec-from-file=- < lista.txt"):
@@ -1376,7 +1418,22 @@ def _selftest():
         ok(tipo("GIT_CONFIG_PARAMETERS=\"'alias.c=push'\" git c", br) == "deny",
            "a mesma variável com comando que a guarda não conhece: nega (não dá para saber o que ele é)")
         ok(tipo("GIT_CONFIG_GLOBAL=/tmp/outro.cfg git fetch", br) == "ask", "com comando conhecido que não é commit: pergunta")
-        ok(d("GIT_CONFIG_GLOBAL=/tmp/outro.cfg git status", br) is None, "com comando de leitura: passa")
+        # configuração trocada por variável pode mandar o git rodar programa até num `status`: leitura também pergunta
+        for cmd in ("GIT_CONFIG_GLOBAL=/tmp/outro.cfg git status", "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager "
+                    "GIT_CONFIG_VALUE_0=x git log", "GIT_CONFIG_PARAMETERS=\"'core.fsmonitor=x'\" git diff"):
+            ok(tipo(cmd, br) == "ask", "configuração por variável + leitura devia perguntar: %r → %r" % (cmd, d(cmd, br)))
+        ok(d("GIT_DIR=%s git status" % os.path.join(br, ".git"), tmp) is None,
+           "variável que só muda QUAL repositório + leitura: passa")
+        # o nome da variável em qualquer forma, com ou sem `=` na mesma palavra
+        for cmd in ("export GIT_DIR; git commit -m x", "read -r GIT_INDEX_FILE < arq; export GIT_INDEX_FILE; git commit -m x",
+                    ': "${GIT_DIR:=/outro}"; git commit -m x', "printf -v GIT_WORK_TREE %s /outro; git commit -m x",
+                    "export GIT_CONFIG_GLOBAL; git commit -m x"):
+            ok(tipo(cmd, br) == "deny", "nome da variável sem `=` + commit devia negar: %r → %r" % (cmd, d(cmd, br)))
+        # arquivo de ambiente carregado na mesma linha do commit: a guarda não lê o arquivo, então pergunta
+        for cmd in ("source ./env.sh && git commit -m x", ". ./env.sh; git commit -m x", "set -a; git commit -m x",
+                    "set -o allexport && git commit -m x"):
+            ok(tipo(cmd, br) == "ask", "ambiente carregado + commit devia perguntar: %r → %r" % (cmd, d(cmd, br)))
+        ok(d("source venv/bin/activate && python -m pytest", br) is None, "ambiente carregado sem commit: passa")
         run(raiz, "git", "config", "alias.tudo", "add -A")
         ok(tipo("git tudo") == "deny", "apelido de `add -A` na raiz do OS nega")
         # -- repositório desviado na linha: a guarda examinaria outro, então não deixa comitar
