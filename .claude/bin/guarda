@@ -15,7 +15,11 @@ NEGA (o Claude não roda; o motivo aparece para ele e para você):
   - `git add -A`, `git add .`, `git add :/` e `git commit -a` no repositório da RAIZ do OS (add é por caminho);
   - `rm -r` em cima da raiz, de brain/, brain/privado/, arquivo/, da sua pasta pessoal, com curinga
     dentro de uma delas (`brain/*`), de um .git ou de um projeto inteiro do OS;
-  - commit que leva segredo (chave, token, senha, string de conexão, .env, .pem).
+  - commit que leva segredo (chave, token, senha, string de conexão, .env, .pem), ou que a guarda
+    não consegue examinar por inteiro;
+  - apelido do git (`git ci`, `git st`: escreva `git commit`, `git status`) e configuração na linha
+    que muda o que o git faz (`-c alias.…`, `--config-env`, `GIT_DIR=…` com commit). A guarda não
+    interpreta: o que ela não lê, não passa.
 PERGUNTA (o Claude Code para e pede a sua aprovação, com o que o comando faz):
   - `git push` e tudo que sai da máquina e não volta (publicação, GitHub);
   - o que apaga trabalho sem commit (`git reset --hard`, `git clean`, `git checkout .`, `git restore .`,
@@ -50,9 +54,24 @@ PUSH = ("git push", "O código sai desta máquina. Onde há publicação automá
 PUSH_INDIRETO = re.compile(r"\bgit\b.*\bpush\b", re.S)
 # Subcomandos em que a palavra solta `push` é argumento comum, e não o push.
 PUSH_E_ARGUMENTO = {"stash", "help"}
-# Variáveis que apontam o git para outro repositório, outra pasta de trabalho ou outro índice.
-DESVIO_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
-              "GIT_NAMESPACE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT"}
+# Variável que aponta o git para outro repositório, pasta ou índice, ou que lhe dá outra configuração.
+# Procurada no texto inteiro do comando, em qualquer forma de atribuição (`X=…`, `export X=…`,
+# `declare -x X=…`, `env X=…`): onde ela foi posta não importa, importa que o git vai obedecer.
+DESVIO_TXT = re.compile(r"\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|"
+                        r"COMMON_DIR|NAMESPACE|CONFIG\w*)=")
+# Configuração posta na linha com `-c`. A que muda O QUE o git faz é negada; a de uso comum passa;
+# qualquer outra pergunta. Nomes em minúscula (o git não distingue).
+CFG_NEGADA = ("alias.", "includeif.", "include.")
+CFG_NEGADA_EXATA = {"core.worktree", "core.bare"}
+CFG_CONHECIDA = {"user.name", "user.email", "core.quotepath", "core.pager", "core.editor", "commit.gpgsign",
+                 "tag.gpgsign", "init.defaultbranch", "credential.helper", "core.autocrlf", "pull.rebase",
+                 "gc.auto", "protocol.version", "core.filemode"}
+CFG_CONHECIDA_PREFIXO = ("advice.", "color.")
+# Subcomandos que só leem: com o repositório desviado, não há o que proteger.
+LEITURA = {"status", "log", "diff", "show", "rev-parse", "rev-list", "ls-files", "ls-remote", "describe",
+           "blame", "shortlog", "cat-file", "grep", "for-each-ref", "help", "version"}
+POR_EXTENSO = ("A guarda não segue apelido nem configuração que mude o que o git faz: seguir é interpretar, e é "
+               "aí que ela erraria calada. Escreva o comando do git por extenso (`git commit …`, `git push …`).")
 SAI_DA_MAQUINA = [
     (r"\bvercel\b[^|;&\n]*--prod\b", "publicação em produção (Vercel)",
      "O site no ar passa a servir este código imediatamente."),
@@ -179,25 +198,19 @@ def _til(caminho, home):
 
 
 def comandos(cmd, cwd, home):
-    """[(pasta, palavras, variáveis)] de cada comando simples, na ordem; a pasta segue os `cd`
-    anteriores, e as variáveis são as postas na frente dele (`X=1 cmd`) ou exportadas antes.
+    """[(pasta, palavras)] de cada comando simples, na ordem; a pasta segue os `cd` anteriores.
     Leitura por texto: o que estiver em variável, `eval` ou dentro de aspas não é visto."""
-    saida, atual, exportadas = [], cwd, []
+    saida, atual = [], cwd
     for trecho in trechos(cmd):
-        p, variaveis = _palavras(trecho), list(exportadas)
+        p = _palavras(trecho)
         while p and (ATRIBUICAO.match(p[0]) or p[0] in PREFIXO):
-            if ATRIBUICAO.match(p[0]):
-                variaveis.append(p[0].split("=", 1)[0])
             p = p[1:]
         if not p:
             continue
         if p[0] == "cd" and len(p) > 1:
             atual = os.path.normpath(os.path.join(atual, _til(p[1], home)))
             continue
-        if p[0] == "export":
-            exportadas += [a.split("=", 1)[0] for a in p[1:] if not a.startswith("-")]
-            continue
-        saida.append((atual, p, variaveis))
+        saida.append((atual, p))
     return saida
 
 
@@ -205,16 +218,15 @@ _EMBUTIDOS = None
 
 
 def embutidos():
-    """Nomes que o git trata como comando dele. Apelido com um desses nomes o git IGNORA; se a
-    guarda o seguisse, um `alias.commit=status` a faria examinar um `status` enquanto o git faz
-    o commit. A lista fixa cobre o que a guarda vigia; a do próprio git completa o resto."""
+    """Nomes que o git trata como comando dele (os de dentro e os `git-<nome>` instalados).
+    Apelido com um desses nomes o git IGNORA, então para eles a guarda nem pergunta por apelido."""
     global _EMBUTIDOS
     if _EMBUTIDOS is None:
         fixos = {"add", "am", "apply", "branch", "checkout", "cherry-pick", "clean", "clone", "commit", "config",
                  "diff", "fetch", "help", "init", "log", "merge", "mv", "pull", "push", "rebase", "remote", "reset",
                  "restore", "revert", "rm", "show", "stash", "status", "switch", "tag", "worktree"}
         try:
-            r = subprocess.run(["git", "--list-cmds=builtins"], capture_output=True, text=True, timeout=3)
+            r = subprocess.run(["git", "--list-cmds=main,others,nohelpers"], capture_output=True, text=True, timeout=3)
             fixos |= set(r.stdout.split()) if r.returncode == 0 else set()
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -222,69 +234,52 @@ def embutidos():
     return _EMBUTIDOS
 
 
+def apelido_de(pasta, sub):
+    """O que o apelido `sub` vale; "" se não é apelido; None se não deu para saber."""
+    try:
+        r = subprocess.run(["git", "-C", pasta, "config", "--get", "alias." + sub], capture_output=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode == 0:
+        return r.stdout.decode("utf-8", "replace").strip() or "(vazio)"
+    return "" if r.returncode == 1 else None
+
+
 def gits(cmd, cwd, home):
-    """[(pasta, subcomando, argumentos, palavras cruas, extra)] de cada `git` do comando.
-    A pasta segue `cd` e `-C`. Apelido (`alias`, do repositório ou definido na linha com `-c`)
-    já vem trocado pelo que vale, para TODO subcomando; apelido de shell (`!…`) vem como
-    subcomando "!" com o texto a rodar. `extra["desvio"]`: a linha aponta o git para outro
-    repositório ou índice. `extra["incerto"]`: há configuração que não dá para ler daqui."""
+    """[(pasta, subcomando, argumentos, palavras cruas, extra)] de cada `git` do comando; a pasta
+    segue `cd` e `-C`. A guarda NÃO interpreta apelido nem configuração: só anota o que viu, e
+    quem decide é `decidir`. extra: `config` = nomes postos com `-c` (em minúscula); `config_env`
+    = há `--config-env`; `desvio` = a linha aponta o git para outro repositório ou pasta."""
     saida = []
-    for atual, p, variaveis in comandos(cmd, cwd, home):
+    for atual, p in comandos(cmd, cwd, home):
         if os.path.basename(p[0]) != "git":
             continue
-        pasta, i, na_linha = atual, 1, {}
-        extra = {"desvio": bool(DESVIO_ENV & set(variaveis)), "incerto": False}
-
-        def apelido_na_linha(par):
-            # Nome de configuração do git não distingue maiúscula de minúscula: `Alias.P` é `alias.p`.
-            if par.lower().startswith("alias.") and "=" in par:
-                chave, valor = par.split("=", 1)
-                na_linha[chave[6:].lower()] = valor
-
+        pasta, i = atual, 1
+        extra = {"config": [], "config_env": False, "desvio": False}
         while i < len(p) and p[i].startswith("-"):
             o = p[i]
             if o == "-C" and i + 1 < len(p):
                 pasta = os.path.normpath(os.path.join(pasta, _til(p[i + 1], home)))
                 i += 2
             elif o == "-c" and i + 1 < len(p):
-                apelido_na_linha(p[i + 1])
+                extra["config"].append(p[i + 1].split("=", 1)[0].lower())
                 i += 2
             elif o.startswith("-c") and not o.startswith("--") and len(o) > 2:
-                apelido_na_linha(o[2:])
+                extra["config"].append(o[2:].split("=", 1)[0].lower())
                 i += 1
-            elif o in ("--git-dir", "--work-tree") and i + 1 < len(p):
+            elif o in ("--git-dir", "--work-tree", "--namespace") and i + 1 < len(p):
                 extra["desvio"] = True
                 i += 2
-            elif o.startswith(("--git-dir=", "--work-tree=")):
+            elif o.startswith(("--git-dir=", "--work-tree=", "--namespace=")):
                 extra["desvio"] = True
                 i += 1
-            elif o == "--namespace" and i + 1 < len(p):
-                i += 2
             elif o.startswith("--config-env"):
-                extra["incerto"] = True                 # o valor mora numa variável de ambiente: não é lido
+                extra["config_env"] = True
                 i += 1 if "=" in o else 2
             else:
                 i += 1
-        if i >= len(p):
-            continue
-        sub, args = p[i], p[i + 1:]
-        for _ in range(3):                              # apelido de apelido, até três níveis
-            if sub in embutidos() or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]*$", sub):
-                break
-            valor = na_linha.get(sub.lower())
-            if valor is None:
-                valor = _git(pasta, "config", "--get", "alias." + sub)
-            valor = (valor or "").strip()
-            if not valor:
-                break
-            if valor.startswith("!"):
-                sub, args = "!", [valor[1:].strip()] + args
-                break
-            palavras = _palavras(valor)
-            if not palavras:
-                break
-            sub, args = palavras[0], palavras[1:] + args
-        saida.append((pasta, sub, args, p, extra))
+        if i < len(p):
+            saida.append((pasta, p[i], p[i + 1:], p, extra))
     return saida
 
 
@@ -293,14 +288,12 @@ def chamadas_git(cmd, cwd, home=None):
     return [g[:3] for g in gits(cmd, cwd, home or os.path.expanduser("~"))]
 
 
-def palavras_do_push(sub, args, cruas, extra):
+def palavras_do_push(sub, cruas):
     """Se este `git` é (ou pode ser) um push: as palavras a examinar atrás de opção de força.
     None se não é. Na dúvida é push: opção global que a leitura não conhece pode ter feito o
-    valor dela passar por subcomando, e configuração que não dá para ler pode esconder um apelido."""
-    todas = cruas[1:] + args
-    if sub == "push" or extra["incerto"]:
-        return todas
-    if "push" in todas and sub not in PUSH_E_ARGUMENTO and sub != "!":
+    valor dela passar por subcomando."""
+    todas = cruas[1:]
+    if sub == "push" or ("push" in todas and sub not in PUSH_E_ARGUMENTO):
         return todas
     return None
 
@@ -611,7 +604,7 @@ def rm_perigoso(cmd, cwd, raiz, home):
     def guardada(alvo):
         return any(alvo == g or g.startswith(alvo.rstrip("/") + "/") for g in guardados)
 
-    for atual, p, _v in comandos(cmd, cwd, home):
+    for atual, p in comandos(cmd, cwd, home):
         if os.path.basename(p[0]) != "rm":
             continue
         args = p[1:]
@@ -645,15 +638,17 @@ def add_em_bloco(args, pasta, topo):
     curtas = _curtas(args)
     if "--all" in args or "--update" in args or "--no-ignore-removal" in args or {"A", "u"} & curtas:
         return True
-    for a in _caminhos(args):
-        if a in ("*", ":/", ":/.", ":/*") or a.startswith(":(top)"):
-            return True
-        if not GLOB.search(a) and _real(os.path.join(pasta, a)) == topo:
-            return True                                # `.`, `./`, `..` a partir de uma subpasta
-    return False
+    return any(caminho_em_bloco(a, pasta, topo) for a in _caminhos(args))
 
 
-def decidir(cmd, cwd, raiz=RAIZ, home=None, _nivel=0):
+def caminho_em_bloco(a, pasta, topo):
+    """Caminho que não é um nome exato: curinga (`*.md`, `b?ain`), caminho "mágico" do git (`:/`,
+    `:(glob)**`, `:!x`), ou a própria raiz do repositório (`.`, `./`, `..` de uma subpasta).
+    O que o curinga casa quem decide é o git, na hora; a guarda não adivinha: é bloco."""
+    return bool(GLOB.search(a)) or a.startswith(":") or _real(os.path.join(pasta, a)) == topo
+
+
+def decidir(cmd, cwd, raiz=RAIZ, home=None):
     """("deny" | "ask", motivo) ou None. Negar vence perguntar."""
     home = home or os.path.expanduser("~")
     raiz_real = _real(raiz)
@@ -666,27 +661,43 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None, _nivel=0):
     fim = time.monotonic() + PRAZO          # um prazo só para tudo que esta chamada examinar
     todos = gits(cmd, cwd, home)
     so3 = [g[:3] for g in todos]
+    desviado = bool(DESVIO_TXT.search(cmd))
     for pasta, sub, args, cruas, extra in todos:
         curtas = _curtas(args)
         topo = _topo(pasta)
         na_raiz = topo == raiz_real
-        if sub == "!":
-            # Apelido de shell: o texto dele é um comando como outro qualquer, e passa pela mesma régua.
-            dentro = decidir(args[0], topo, raiz, home, _nivel + 1) if _nivel < 3 else ("ask", "")
-            if dentro and dentro[0] == "deny":
-                return dentro
-            if dentro:
-                perguntas.append(("apelido do git que roda outro comando", "Ele chama: " + args[0][:80]))
-            continue
-        if extra["desvio"] and sub == "commit":
-            return ("deny", "Este commit aponta o git para outro repositório, outra pasta ou outro índice "
-                            "(`--git-dir`, `--work-tree`, `GIT_DIR`, `GIT_INDEX_FILE`). Não consigo examinar o que "
-                            "ele levaria, e commit sem exame não passa. Rode de dentro da pasta do repositório, "
-                            "sem esses desvios.")
-        if extra["desvio"] and sub == "add":
-            perguntas.append(("git add com o repositório desviado",
-                              "A linha aponta o git para outro repositório ou outra pasta; confira qual."))
-        do_push = palavras_do_push(sub, args, cruas, extra)
+        # -- o que a guarda não lê, não passa (vale para QUALQUER subcomando, antes de qualquer outra regra)
+        negadas = [k for k in extra["config"] if k.startswith(CFG_NEGADA) or k in CFG_NEGADA_EXATA]
+        if extra["config_env"] or negadas:
+            return ("deny", "Esta linha muda a configuração do git só para esta chamada (%s). %s"
+                            % (", ".join("`-c %s`" % k for k in negadas) or "`--config-env`", POR_EXTENSO))
+        conhecido = sub in embutidos()
+        if not conhecido and re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]*$", sub):
+            vale = apelido_de(pasta, sub)
+            if vale:
+                return ("deny", "`git %s` é um apelido (vale `%s`). %s" % (sub, vale[:80], POR_EXTENSO))
+            if vale is None:
+                perguntas.append(("comando do git que não reconheço: " + sub,
+                                  "Não consegui confirmar se é um apelido. Confira o que ele faz."))
+        estranhas = [k for k in extra["config"]
+                     if k not in CFG_CONHECIDA and not k.startswith(CFG_CONHECIDA_PREFIXO)]
+        if estranhas:
+            perguntas.append(("configuração na linha: " + ", ".join(estranhas),
+                              "Muda como o git se comporta só nesta chamada. Confira para quê."))
+        if extra["desvio"] or desviado:
+            if sub == "commit" or not conhecido:
+                return ("deny", "Esta linha aponta o git para outro repositório, outra pasta, outro índice ou outra "
+                                "configuração (`--git-dir`, `--work-tree`, `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG…`). "
+                                "Não consigo examinar o que ela faria, e sem exame não passa. Rode de dentro da "
+                                "pasta do repositório, sem esses desvios.")
+            if sub not in LEITURA:
+                perguntas.append(("git com o repositório ou a configuração desviados",
+                                  "A linha aponta o git para outro lugar; confira qual."))
+        if sub in ("commit", "add") and any(a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
+                                            for a in args):
+            return ("deny", "`--pathspec-from-file` passa os caminhos por um arquivo que a guarda não lê. "
+                            "Nomeie os caminhos na própria linha.")
+        do_push = palavras_do_push(sub, cruas)
         if do_push is not None:
             if ("--force" in do_push or "--force-with-lease" in do_push or "--mirror" in do_push
                     or "f" in _curtas(do_push)
@@ -726,8 +737,7 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None, _nivel=0):
             limpos = _sem_valores(args)
             de_tudo = "a" in _curtas(limpos) or "--all" in limpos
             proprios = _caminhos(limpos)                # caminhos nomeados no próprio commit
-            em_bloco = any(c in ("*", ":/", ":/.", ":/*") or c.startswith(":(top)")
-                           or (not GLOB.search(c) and _real(os.path.join(pasta, c)) == topo) for c in proprios)
+            em_bloco = any(caminho_em_bloco(c, pasta, topo) for c in proprios)
             if na_raiz and (de_tudo or em_bloco):
                 return ("deny", "No repositório da raiz do OS o commit é sempre POR CAMINHO "
                                 "(`git commit --only -m … -- <caminhos>`). `-a` e `.` levam junto o que é de "
@@ -752,7 +762,7 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None, _nivel=0):
                                 "Se for alarme falso (texto que só parece senha), diga isso a quem é dono do OS: "
                                 "quem decide é a pessoa, e o commit ela mesma faz no terminal.")
 
-    for _atual, p, _v in comandos(cmd, cwd, home):
+    for _atual, p in comandos(cmd, cwd, home):
         if os.path.basename(p[0]) != "git" and PUSH_INDIRETO.search(" ".join(p)):
             perguntas.append(PUSH)
     for rx, rotulo, efeito in SAI_DA_MAQUINA:
@@ -904,13 +914,11 @@ def _selftest():
         for cmd in ("git push -n", "git push --dry-run origin main", "git -C site push --dry-run",
                     "git push -onightly", "git push -o --dry-run origin main", "git push --repo=x -o n",
                     "xargs git --no-pager push", "bash -c 'git --no-pager push origin main'",
-                    "git --no-pager push", "git -c alias.p=push p", "git -c alias.x=status push",
-                    "git --config-env=x=Y push", "git --exec-path /x push origin main", "git sobe origin main",
-                    "git -C site sobe"):
+                    "git --no-pager push", "git --exec-path /x push origin main"):
             ok(tipo(cmd) == "ask", "devia perguntar: %r → %r" % (cmd, d(cmd)))
         for cmd in ("git commit --only -m 'prepara o push de amanhã' -- STATUS.md", "git stash push -m x",
                     "git help push", "git config push.default simple", "git remote set-url --push origin x",
-                    "git log --oneline", "git st"):
+                    "git log --oneline", "git ls-files", "git rev-parse HEAD", "git nao-existe-este-comando"):
             ok(d(cmd) is None, "devia passar: %r → %r" % (cmd, d(cmd)))
 
         # -- push forçado: nega (todas as grafias)
@@ -919,19 +927,38 @@ def _selftest():
             ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
 
         # -- git clean
-        # nome de configuração do git não distingue maiúscula: `Alias.P` é `alias.p`
-        for cmd in ("git -c Alias.P='push --force' p", "git -c ALIAS.p='push -f' p", "git -cAlias.p='push --force' p"):
-            ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
-        ok(tipo("git -c ALIAS.p=push p") == "ask", "apelido em maiúscula sem força: pergunta")
-        ok(tipo("git --config-env=Alias.p=VAR p") == "ask", "apelido por variável de ambiente: pergunta")
-        # apelido definido na própria linha: a força escondida no valor dele também nega
-        for cmd in ("git -c alias.p='push --force' p", "git -c 'alias.p=push -f origin main' p",
-                    "git -calias.p='push --force-with-lease' p", "git -c alias.p='!git push --force' p",
-                    "git -c alias.p='push origin +main' p"):
-            ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
-        ok(tipo("git -c alias.p='push origin main' p") == "ask", "apelido na linha sem força: pergunta")
+        # -- apelido do git: a guarda NÃO segue, nega e pede o comando por extenso (sem exceção, nem
+        #    para apelido inofensivo: seguir apelido é interpretar, e interpretar é onde ela erraria calada)
         run(site, "git", "config", "alias.forca", "push --force")
-        ok(tipo("git forca", site) == "deny", "apelido do repositório com força nega")
+        for cmd, onde in (("git sobe origin main", raiz), ("git -C site sobe", raiz), ("git st", raiz),
+                          ("git forca", site), ("git st -x extra", raiz)):
+            r = d(cmd, onde)
+            ok(r and r[0] == "deny" and "por extenso" in r[1], "apelido do repositório devia negar: %r → %r" % (cmd, r))
+        ok("push" in d("git sobe")[1], "o motivo mostra o que o apelido vale")
+        # definido na própria linha, em qualquer grafia (nome de configuração não distingue maiúscula)
+        for cmd in ("git -c alias.p=push p", "git -c alias.x=status push", "git -c Alias.P='push --force' p",
+                    "git -c ALIAS.p='push -f' p", "git -cAlias.p='push --force' p", "git -c alias.p='!git push --force' p",
+                    "git -c 'alias.p=push -f origin main' p", "git -c alias.st=status st", "git -c alias.x=y status"):
+            ok(tipo(cmd) == "deny", "apelido na linha devia negar: %r → %r" % (cmd, d(cmd)))
+        # configuração na linha: a que muda O QUE o git faz nega; a conhecida passa; o resto pergunta
+        for cmd in ("git --config-env=x=Y push", "git --config-env=Alias.p=VAR p", "git --config-env x=Y status",
+                    "git -c core.worktree=/outro commit -m x", "git -c include.path=/x/cfg status",
+                    "git -c includeIf.gitdir:/x.path=/y status", "git -c Core.WorkTree=/outro add a.txt"):
+            ok(tipo(cmd) == "deny", "configuração na linha devia negar: %r → %r" % (cmd, d(cmd)))
+        for cmd in ("git -c user.name=Ana -c user.email=ana@exemplo.com log", "git -c core.quotepath=off status",
+                    "git -c color.ui=never diff --stat", "git -c advice.detachedHead=false log"):
+            ok(d(cmd) is None, "configuração conhecida devia passar: %r → %r" % (cmd, d(cmd)))
+        for cmd in ("git -c core.hooksPath=/x status", "git -c diff.external=x log", "git -cfoo.bar=1 status"):
+            ok(tipo(cmd) == "ask", "configuração desconhecida devia perguntar: %r → %r" % (cmd, d(cmd)))
+        # lista de caminhos em arquivo: a guarda não lê, então não passa
+        for cmd in ("git add --pathspec-from-file=lista.txt", "git commit --pathspec-from-file lista.txt -m x",
+                    "git add --pathspec-from-file=- < lista.txt"):
+            ok(tipo(cmd, site) == "deny", "lista de caminhos em arquivo devia negar: %r → %r" % (cmd, d(cmd, site)))
+        # na raiz do OS, caminho é nome exato: curinga e caminho "mágico" do git são bloco
+        for cmd in ("git add '*.md'", "git add 'brain/*'", "git add ':(glob)**'", "git add ':!privado'", "git add b*",
+                    "git commit -m x -- '*.md'", "git commit -m x -- ':(top)'", "git commit -m x -- 'b?ain'"):
+            ok(tipo(cmd) == "deny", "curinga na raiz devia negar: %r → %r" % (cmd, d(cmd)))
+        ok(d("git add '*.js'", site) is None, "curinga dentro do projeto passa")
         ok(tipo("git clean -fdx") == "deny", "clean -fdx nega")
         ok(tipo("git clean -fdX") == "deny", "clean -X nega")
         ok(tipo("git -C site clean -xfd") == "deny", "clean -x nega em qualquer repo")
@@ -1308,34 +1335,48 @@ def _selftest():
         escreve("a.bin", sujo_b)
         ok(tipo("git commit -m x -- a.bin", br) == "deny", "commit por caminho de binário sujo nega")
         run(br, "git", "reset", "-q", "--hard", "HEAD")
-        # -- apelido do git vale para todo subcomando, não só para o push
+        # -- apelido em outro repositório: mesma regra, com ou sem segredo, de comando ou de shell
         run(br, "git", "config", "alias.ci", "commit")
         run(br, "git", "config", "alias.salva", "commit -a -m salva")
         run(br, "git", "config", "alias.manda", "!git push --force origin main")
         run(br, "git", "config", "alias.limpa", "clean -fdx")
         run(br, "git", "config", "alias.st", "status -sb")
-        escreve("app2.js", ("const k = '" + chave2 + "';\n").encode())
-        ok(tipo("git salva", br) == "deny", "apelido de `commit -a` com segredo fora do índice nega")
-        run(br, "git", "add", "app2.js")
-        ok(tipo("git ci -m x", br) == "deny", "apelido de commit com segredo no índice nega")
-        ok(tipo("git -c alias.c=commit c -m x", br) == "deny", "apelido de commit definido na linha nega")
-        ok(tipo("git -c Alias.C='commit -m x' c", br) == "deny", "idem, com maiúscula e a mensagem dentro do apelido")
-        run(br, "git", "reset", "-q", "--hard", "HEAD")
-        ok(d("git ci -m x", br) is None, "apelido de commit sem segredo passa")
-        ok(d("git st", br) is None, "apelido inofensivo passa")
+        run(br, "git", "config", "alias.l1", "l2")
+        run(br, "git", "config", "alias.l2", "-C /tmp commit -m x")
+        for cmd in ("git salva", "git ci -m x", "git st", "git manda", "git manda --mais argumentos", "git limpa",
+                    "git l1", "git l2", "git -c alias.c=commit c -m x", "git -c Alias.C='commit -m x' c"):
+            ok(tipo(cmd, br) == "deny", "apelido devia negar: %r → %r" % (cmd, d(cmd, br)))
         # o git ignora apelido com nome de comando dele; a guarda não pode cair nessa
         run(br, "git", "config", "alias.commit", "status")
         escreve("app2.js", ("const k = '" + chave2 + "';\n").encode())
         run(br, "git", "add", "app2.js")
         ok(tipo("git commit -m x", br) == "deny", "apelido chamado `commit` não desliga o exame do commit")
         ok(tipo("git -c alias.commit=status commit -m x", br) == "deny", "nem o definido na linha")
+        run(br, "git", "reset", "-q", "--hard", "HEAD")
+        ok(d("git commit -m x", br) is None, "e, sem segredo, `git commit` com um apelido homônimo configurado passa "
+                                               "(o git ignora esse apelido; negar aqui travaria todo commit)")
         run(br, "git", "config", "--unset", "alias.commit")
+        # sem conseguir saber se é apelido: pergunta, não passa calado
+        global apelido_de
+        apelido_real, apelido_de = apelido_de, (lambda pasta, sub: None)
+        try:
+            ok(tipo("git comando-que-nao-sei", br) == "ask", "não deu para saber se é apelido: pergunta")
+        finally:
+            apelido_de = apelido_real
         run(br, "git", "reset", "-q", "--hard", "HEAD")
         ok(tipo("git commit -m x -- .") == "deny", "na raiz do OS, commit de `.` é commit em bloco: nega")
         ok(tipo("export GIT_DIR=%s; git commit -m x" % os.path.join(br, ".git"), tmp) == "deny",
            "GIT_DIR exportado antes também conta")
-        ok(tipo("git manda", br) == "deny", "apelido de shell com push forçado nega")
-        ok(tipo("git limpa", br) == "deny", "apelido de `clean -fdx` nega")
+        for cmd in ("declare -x GIT_DIR=%s; git commit -m x" % os.path.join(br, ".git"),
+                    "GIT_CONFIG_PARAMETERS=\"'alias.c=commit'\" git c -m x",
+                    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.c GIT_CONFIG_VALUE_0=commit git commit -m x",
+                    "GIT_CONFIG_GLOBAL=/tmp/outro.cfg git commit -m x", "env GIT_INDEX_FILE=/tmp/i git commit -m x"):
+            r = d(cmd, br)
+            ok(r and r[0] == "deny", "variável que desvia ou reconfigura o git, com commit, nega: %r → %r" % (cmd, r))
+        ok(tipo("GIT_CONFIG_PARAMETERS=\"'alias.c=push'\" git c", br) == "deny",
+           "a mesma variável com comando que a guarda não conhece: nega (não dá para saber o que ele é)")
+        ok(tipo("GIT_CONFIG_GLOBAL=/tmp/outro.cfg git fetch", br) == "ask", "com comando conhecido que não é commit: pergunta")
+        ok(d("GIT_CONFIG_GLOBAL=/tmp/outro.cfg git status", br) is None, "com comando de leitura: passa")
         run(raiz, "git", "config", "alias.tudo", "add -A")
         ok(tipo("git tudo") == "deny", "apelido de `add -A` na raiz do OS nega")
         # -- repositório desviado na linha: a guarda examinaria outro, então não deixa comitar

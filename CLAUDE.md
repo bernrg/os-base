@@ -53,7 +53,7 @@ Nunca duplicar, sempre apontar. Desempate nota/memória/skill, anatomia da nota 
 
 As regras acima não dependem só de eu lembrar. `.claude/bin/guarda` roda antes de todo comando Bash, em qualquer sessão desta máquina:
 
-- **Nega:** push forçado; `git clean` com `-x`; `git add -A`/`.`/`:/` e `commit -a` no repo da raiz; `rm -r` na raiz, em `brain/`, `brain/privado/`, `arquivo/`, na pasta pessoal, com curinga dentro de uma delas, num `.git` ou num projeto inteiro; commit que leva segredo.
+- **Nega:** push forçado; `git clean` com `-x`; `git add -A`/`.`/`:/` e `commit -a` no repo da raiz; `rm -r` na raiz, em `brain/`, `brain/privado/`, `arquivo/`, na pasta pessoal, com curinga dentro de uma delas, num `.git` ou num projeto inteiro; commit que leva segredo ou que não dá para examinar; apelido do git (`git ci`) e configuração na linha que muda o que ele faz (`-c alias.…`, `GIT_DIR=…` com commit). Comando do git é sempre por extenso, e na raiz caminho é nome exato, sem curinga.
 - **Pergunta a {{NOME}}:** `git push`, publicação, mesclar PR; `git reset --hard`, `git clean`, `git checkout .`, `git restore .`, apagar ramo à força, `git stash drop`.
 - O commit automático do fim de sessão (`auto-commit`) usa os mesmos padrões: arquivo que parece levar segredo fica retido, com o motivo em `.claude/abas/auto-commit.log`, e o resto segue.
 - `.claude/settings.json` nega ao Claude ler `.env` e arquivo de chave (`.pem`, `.key`), e editar `.env`. `.env.example` é livre.
