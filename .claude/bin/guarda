@@ -98,6 +98,17 @@ NOME_SEGREDO = re.compile(r"(?:^|/)(?:\.env(?:\.[^/]*)?|[^/]*\.env|[^/]*\.pem|[^
 TETO_ARQUIVOS = 1000          # arquivos novos examinados por commit; acima disso, o commit vai em partes
 PRAZO = 10.0                  # segundos para o exame inteiro (git incluído); o hook tem 20
 PEDACO = 4000                 # linha comprida (código minificado) é examinada em pedaços, com sobra
+BLOCO = 1 << 16               # arquivo é lido em blocos deste tamanho, com sobra entre um e outro
+SOBRA = 512
+UTF16_TETO = 8_000_000
+# Começo de cada formato inconfundível de chave. Em binário só se roda a régua cara onde uma
+# destas aparece: busca de bytes é barata, e textura ou modelo de 50 MB passa em instantes.
+ANCORAS = (b"-----BEGIN", b"AKIA", b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_", b"github_pat_", b"sk-",
+           b"AIza", b"k_live_", b"xox")
+
+
+class SemTempo(Exception):
+    """O prazo do exame acabou no meio. Quem chama trata como "não examinado", nunca como limpo."""
 
 ATRIBUICAO = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 PREFIXO = {"then", "do", "else", "env", "command", "exec", "time", "nohup", "sudo", "{", "}", "!"}
@@ -206,9 +217,12 @@ def palavras_do_push(pasta, sub, p):
     resto = p[1:]
     if sub == "push":
         return resto
-    if any(a.startswith("alias.") or a.startswith("-calias.") for a in resto) or \
-            any(a.startswith("--config-env") for a in resto):
-        return resto                                   # apelido definido na própria linha
+    do_apelido = [w for a in resto if (a.startswith("alias.") or a.startswith("-calias.")) and "=" in a
+                  for w in _palavras(a.split("=", 1)[1])]
+    if do_apelido or any(a.startswith(("alias.", "-calias.", "--config-env")) for a in resto):
+        # Apelido definido na própria linha. O valor dele (`alias.p=push --force`) entra no exame de
+        # força. O de `--config-env` mora numa variável e não é lido: fica na pergunta.
+        return resto + [w.lstrip("!") for w in do_apelido]
     if "push" in resto and sub not in PUSH_E_ARGUMENTO:
         return resto
     if re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]*$", sub or ""):
@@ -286,12 +300,15 @@ def _valor_suspeito(v):
             and not EXEMPLO_RX.search(v))
 
 
-def segredos_no_texto(texto, so_fortes=False):
-    """Rótulos do que parece segredo. Linha comprida vai em pedaços com sobra: o custo fica
-    proporcional ao tamanho, e nada que caiba na sobra se perde na emenda."""
+def segredos_no_texto(texto, so_fortes=False, fim=None):
+    """Rótulos do que parece segredo. Texto comprido vai em pedaços com sobra: o custo fica
+    proporcional ao tamanho, e nada que caiba na sobra se perde na emenda. Com `fim`, o prazo é
+    conferido a cada pedaço e o estouro levanta SemTempo (nunca devolve resultado pela metade)."""
     if len(texto) > PEDACO:
         achados = set()
         for i in range(0, len(texto), PEDACO - 300):
+            if fim is not None and time.monotonic() > fim:
+                raise SemTempo()
             achados.update(segredos_no_texto(texto[i:i + PEDACO], so_fortes))
         return sorted(achados)
     achados = {rotulo for rotulo, rx in FORTES if rx.search(texto)}
@@ -307,18 +324,35 @@ def segredos_no_texto(texto, so_fortes=False):
 
 
 def examinar_arquivo(caminho, nome, fim):
-    """(rótulos, examinou até o fim?) do arquivo inteiro, de qualquer tamanho. Binário (byte nulo
-    no começo, a mesma régua do git) não é lido: segredo mora em texto. Levanta OSError."""
+    """(rótulos, examinou até o fim?) do arquivo inteiro, de qualquer tamanho, lido em blocos com
+    sobra (arquivo de uma linha só não escapa do prazo). Texto passa por todas as réguas. Binário
+    (byte nulo no começo, a régua do git) passa pelas de formato inconfundível de chave, onde
+    houver começo de chave. Texto em UTF-16 é lido como texto. Levanta OSError."""
     so_fortes, achados = bool(NOME_PERMITIDO.search(nome)), set()
-    with open(caminho, "rb") as f:
-        if b"\0" in f.read(8000):
-            return [], True
-        f.seek(0)
-        for bruta in f:
-            if time.monotonic() > fim:
-                return sorted(achados), False
-            achados.update(segredos_no_texto(bruta.decode("utf-8", "replace"), so_fortes))
-    return sorted(achados), True
+    try:
+        with open(caminho, "rb") as f:
+            cabeca = f.read(8000)
+            f.seek(0)
+            if cabeca[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                if os.fstat(f.fileno()).st_size > UTF16_TETO:
+                    return [], False
+                return segredos_no_texto(f.read().decode("utf-16", "replace"), so_fortes, fim), True
+            binario, resto = b"\0" in cabeca, b""
+            while True:
+                if time.monotonic() > fim:
+                    return sorted(achados), False
+                bloco = f.read(BLOCO)
+                if not bloco:
+                    return sorted(achados), True
+                dados = resto + bloco
+                resto = dados[-SOBRA:]
+                if binario:
+                    if any(a in dados for a in ANCORAS):
+                        achados.update(segredos_no_texto(dados.decode("latin-1"), True, fim))
+                else:
+                    achados.update(segredos_no_texto(dados.decode("utf-8", "replace"), so_fortes, fim))
+    except SemTempo:
+        return sorted(achados), False
 
 
 def _arquivos_de(caminho):
@@ -353,13 +387,13 @@ def segredos_dos_caminhos(pasta, caminhos):
     return retidos
 
 
-def segredos_do_commit(pasta, rastreados=False, soltos=None):
+def segredos_do_commit(pasta, rastreados=False, soltos=None, fim=None):
     """([(arquivo, o que parece)], [o que não deu para examinar]) do que o commit levaria.
     Nunca devolve o segredo. Sempre olha o índice. `rastreados`: também o que mudou e ainda não
     está no índice (`commit -a`, ou `git add` na mesma chamada). `soltos`: caminhos do `git add`
     da mesma chamada ([] = tudo), para ler também os arquivos novos que ele levaria.
     Exame que não se completou NÃO é exame limpo: volta na segunda lista, e o commit é negado."""
-    fim = time.monotonic() + PRAZO
+    fim = fim if fim is not None else time.monotonic() + PRAZO      # um prazo só para a chamada inteira
     resta = lambda: fim - time.monotonic()
     achados, falhas = [], []
     if _git(pasta, "rev-parse", "--is-inside-work-tree") is None:
@@ -375,24 +409,41 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None):
             falhas.append("o git não respondeu a tempo ao listar as mudanças")
             return
         arq = "?"
-        for linha in texto.splitlines():
-            if linha.startswith("+++ "):
-                arq = linha[6:] if linha.startswith("+++ b/") else linha[4:]
-            elif linha.startswith("+"):
-                for rotulo in segredos_no_texto(linha[1:], so_fortes=bool(NOME_PERMITIDO.search(arq))):
-                    achados.append((arq, rotulo))
+        try:
+            for linha in texto.splitlines():
+                if linha.startswith("+++ "):
+                    arq = linha[6:] if linha.startswith("+++ b/") else linha[4:]
+                elif linha.startswith("+"):
+                    if time.monotonic() > fim:
+                        raise SemTempo()
+                    for rotulo in segredos_no_texto(linha[1:], bool(NOME_PERMITIDO.search(arq)), fim):
+                        achados.append((arq, rotulo))
+        except SemTempo:
+            falhas.append("não deu tempo de ler todas as mudanças (parei em %s)" % arq)
 
     nomes = _git(pasta, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", prazo=resta())
     if nomes is None:
         falhas.append("o git não respondeu ao listar o que está para comitar")
+    topo = _topo(pasta)
     for arq in filter(None, (nomes or "").split("\0")):
         nome(arq)
     diff("--cached")
+    # Binário não aparece no diff de texto ("Binary files differ"): os que estão para ir são lidos do disco.
+    binarios = _git(pasta, "diff", "--cached", "--numstat", "-z", "--diff-filter=ACMR", prazo=resta())
+    for campo in (binarios or "").split("\0"):
+        partes = campo.split("\t")
+        if len(partes) == 3 and partes[0] == "-" and partes[2]:
+            try:
+                rotulos, completo = examinar_arquivo(os.path.join(topo, partes[2]), partes[2], fim)
+            except OSError:
+                rotulos, completo = [], True               # saiu do disco depois do add: não há o que ler
+            achados.extend((partes[2], r) for r in rotulos)
+            if not completo:
+                falhas.append("não deu tempo de ler tudo (parei em %s)" % partes[2])
     filtro = ["--", *soltos] if soltos else []
     if rastreados or soltos is not None:
         diff(*([] if rastreados else filtro))
     if soltos is not None:
-        topo = _topo(pasta)
         lista = _git(pasta, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", *filtro, prazo=resta())
         if lista is None:
             falhas.append("o git não respondeu ao listar os arquivos novos")
@@ -486,6 +537,7 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
     if rm is not None:
         return ("deny", f"`rm -r` em `{rm[0]}` {rm[1]}.")
 
+    fim = time.monotonic() + PRAZO          # um prazo só para tudo que esta chamada examinar
     todos = gits(cmd, cwd, home)
     so3 = [g[:3] for g in todos]
     for pasta, sub, args, cruas in todos:
@@ -539,7 +591,7 @@ def decidir(cmd, cwd, raiz=RAIZ, home=None):
             if adds:
                 soltos = [] if any(add_em_bloco(a, pasta, topo) or not _caminhos(a) for a in adds) else \
                     [c for a in adds for c in _caminhos(a)]
-            achados, falhas = segredos_do_commit(pasta, rastreados=de_tudo, soltos=soltos)
+            achados, falhas = segredos_do_commit(pasta, rastreados=de_tudo, soltos=soltos, fim=fim)
             if not achados and falhas:
                 return ("deny", "Não consegui examinar este commit por inteiro atrás de segredo: "
                                 + "; ".join(falhas[:3]) + ". Commit sem exame não passa. Comite em partes "
@@ -720,6 +772,14 @@ def _selftest():
             ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
 
         # -- git clean
+        # apelido definido na própria linha: a força escondida no valor dele também nega
+        for cmd in ("git -c alias.p='push --force' p", "git -c 'alias.p=push -f origin main' p",
+                    "git -calias.p='push --force-with-lease' p", "git -c alias.p='!git push --force' p",
+                    "git -c alias.p='push origin +main' p"):
+            ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
+        ok(tipo("git -c alias.p='push origin main' p") == "ask", "apelido na linha sem força: pergunta")
+        run(site, "git", "config", "alias.forca", "push --force")
+        ok(tipo("git forca", site) == "deny", "apelido do repositório com força nega")
         ok(tipo("git clean -fdx") == "deny", "clean -fdx nega")
         ok(tipo("git clean -fdX") == "deny", "clean -X nega")
         ok(tipo("git -C site clean -xfd") == "deny", "clean -x nega em qualquer repo")
@@ -876,13 +936,47 @@ def _selftest():
         with open(os.path.join(site, "grande.js"), "w") as f:
             f.write("// linha comum\n" * 40000 + 'const k = "%s";\n' % chave2)        # ~600 KB, segredo no fim
         with open(os.path.join(site, "textura.bin"), "wb") as f:
-            f.write(b"\x00\x01\x02" * 400000 + chave2.encode())                         # binário grande
+            f.write(b"\x00\x01\x02" * 400000)                                          # binário grande, sem chave
+        with open(os.path.join(site, "banco.bin"), "wb") as f:
+            f.write(b"\x00\x01\x02" * 400000 + chave2.encode() + b"\x00" * 50)          # binário COM chave
+        with open(os.path.join(site, "nota16.txt"), "wb") as f:
+            f.write(("a chave é " + chave2 + "\n").encode("utf-16"))                    # texto em UTF-16
+        with open(os.path.join(site, "minificado.js"), "w") as f:
+            f.write("a=1;" * 600000 + chave2 + ";b=2;" * 600000)                        # ~5 MB numa linha só
         with open(os.path.join(site, "limpo.js"), "w") as f:
             f.write("console.log('oi')\n")
         por_caminho = segredos_dos_caminhos(site, ["configuração/ação.js", "grande.js", "textura.bin", "limpo.js",
-                                                   "sumiu.js"])
-        ok(sorted(por_caminho) == ["configuração/ação.js", "grande.js"],
-           "por caminho: acento e arquivo grande são pegos, com a chave IGUAL ao caminho pedido: %r" % (por_caminho,))
+                                                   "sumiu.js", "banco.bin", "nota16.txt", "minificado.js"])
+        ok(sorted(por_caminho) == ["banco.bin", "configuração/ação.js", "grande.js", "minificado.js", "nota16.txt"],
+           "por caminho: acento, arquivo grande, binário com chave, UTF-16 e linha única são pegos, "
+           "com a chave IGUAL ao caminho pedido: %r" % (sorted(por_caminho),))
+        ok(tipo("git add banco.bin && git commit -m x", site) == "deny", "hook: chave dentro de binário nega")
+        ok(tipo("git add nota16.txt && git commit -m x", site) == "deny", "hook: segredo em texto UTF-16 nega")
+        run(site, "git", "add", "-f", "banco.bin")           # já no índice: o diff de texto só diz "binário"
+        r = d("git commit -m x", site)
+        ok(r and r[0] == "deny" and "banco.bin" in r[1], "hook: binário com chave já em stage nega: %r" % (r,))
+        run(site, "git", "rm", "-q", "-f", "--cached", "banco.bin")
+        run(site, "git", "add", "-f", "textura.bin")
+        ok(d("git commit -m x", site) is None, "hook: binário sem chave em stage passa")
+        run(site, "git", "rm", "-q", "-f", "--cached", "textura.bin")
+        # segredo em cima da emenda entre dois blocos de leitura (texto e binário)
+        with open(os.path.join(site, "emenda.js"), "w") as f:
+            f.write("x" * (BLOCO - 10) + " " + chave2 + " " + "y" * 100)
+        with open(os.path.join(site, "emenda.bin"), "wb") as f:
+            f.write(b"\x00" * (BLOCO - 10) + chave2.encode() + b"\x00" * 100)
+        ok(sorted(segredos_dos_caminhos(site, ["emenda.js", "emenda.bin"])) == ["emenda.bin", "emenda.js"],
+           "segredo partido entre dois blocos é achado, em texto e em binário")
+        os.remove(os.path.join(site, "emenda.js"))
+        os.remove(os.path.join(site, "emenda.bin"))
+        # o prazo vale DENTRO do arquivo de uma linha só: volta logo e diz que não terminou
+        t0 = time.monotonic()
+        rot, completo = examinar_arquivo(os.path.join(site, "minificado.js"), "minificado.js", time.monotonic() + 0.02)
+        ok(completo is False and time.monotonic() - t0 < 3, "prazo é conferido dentro de arquivo de uma linha só")
+        try:
+            segredos_no_texto("a=1;" * 100000, fim=time.monotonic() - 1)
+            ok(False, "linha comprida com prazo vencido devia avisar")
+        except SemTempo:
+            ok(True, "linha comprida com prazo vencido avisa em vez de seguir")
         ok(chave2 not in json.dumps(por_caminho), "por caminho: nunca devolve o valor")
         # linha comprida (código minificado): o segredo é achado no meio e em cima da emenda dos pedaços
         ok(segredos_no_texto("a=1;" * 5000 + chave2 + ";b=2;" * 5000) != [], "segredo no meio de linha comprida")
@@ -918,7 +1012,7 @@ def _selftest():
         run(site, "git", "rm", "-q", "-f", "--cached", "produção/.env")
         for resto in ("configuração", "produção"):
             shutil.rmtree(os.path.join(site, resto))
-        for resto in ("grande.js", "textura.bin", "limpo.js"):
+        for resto in ("grande.js", "textura.bin", "limpo.js", "banco.bin", "nota16.txt", "minificado.js"):
             os.remove(os.path.join(site, resto))
         # git que falha no meio do exame: o commit não passa sem exame
         global _git
