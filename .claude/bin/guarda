@@ -107,6 +107,11 @@ ANCORAS = (b"-----BEGIN", b"AKIA", b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_", 
            b"AIza", b"k_live_", b"xox")
 
 
+# O diff que a guarda lê é o conteúdo cru: conversor de texto (`textconv`, por .gitattributes) e diff
+# externo configurados no repositório trocariam o que ela enxerga por outra coisa, ou por nada.
+CRU = ("--no-textconv", "--no-ext-diff")
+
+
 class SemTempo(Exception):
     """O prazo do exame acabou no meio. Quem chama trata como "não examinado", nunca como limpo."""
 
@@ -365,7 +370,9 @@ def ler_do_indice(pasta, caminho, fim):
     mudado ou o arquivo tenha sido apagado depois do `git add`. Se o git não entrega o conteúdo
     inteiro, o exame não terminou (nunca "nada a relatar")."""
     try:
-        proc = subprocess.Popen(["git", "-C", pasta, "cat-file", "blob", ":" + caminho],
+        # `:0:<caminho>`: com o estágio escrito, o resto é caminho ao pé da letra. Só `:<caminho>` leria
+        # um arquivo chamado `0:x` como "o x do estágio 0", isto é, outro arquivo.
+        proc = subprocess.Popen(["git", "-C", pasta, "cat-file", "blob", ":0:" + caminho],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
         return [], False
@@ -434,7 +441,7 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None, fim=None):
             achados.append((arq, "arquivo de segredo pelo nome"))
 
     def texto(opcoes, filtro):
-        saida = _git(pasta, "diff", *opcoes, "-U0", "--no-color", *filtro, prazo=resta())
+        saida = _git(pasta, "diff", *opcoes, *CRU, "-U0", "--no-color", *filtro, prazo=resta())
         if saida is None:
             falhas.append("o git não respondeu a tempo ao listar as mudanças")
             return
@@ -453,7 +460,7 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None, fim=None):
 
     def binarios(opcoes, filtro, leitor):
         # --no-renames: uma linha por arquivo, sempre `acrescentadas<TAB>tiradas<TAB>caminho`; `-` = binário.
-        saida = _git(pasta, "diff", *opcoes, "--numstat", "-z", "--no-renames", "--diff-filter=ACMR", *filtro,
+        saida = _git(pasta, "diff", *opcoes, *CRU, "--numstat", "-z", "--no-renames", "--diff-filter=ACMR", *filtro,
                      prazo=resta())
         if saida is None:
             falhas.append("o git não respondeu ao listar os arquivos binários")
@@ -474,7 +481,8 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None, fim=None):
             return [], False
 
     # 1. o que já está no índice
-    nomes = _git(pasta, "diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=ACMR", prazo=resta())
+    nomes = _git(pasta, "diff", "--cached", *CRU, "--name-only", "-z", "--no-renames", "--diff-filter=ACMR",
+                 prazo=resta())
     if nomes is None:
         falhas.append("o git não respondeu ao listar o que está para comitar")
     for arq in filter(None, (nomes or "").split("\0")):
@@ -1130,6 +1138,40 @@ def _selftest():
         r = d("git commit -m x", br)
         ok(r and r[0] == "deny" and "renomeado.bin" in r[1], "binário renomeado e sujo no índice: nega: %r" % (r,))
         run(br, "git", "reset", "-q", "--hard", "HEAD")
+        # nome com dois-pontos: `:0:seg.bin` não pode virar "o seg.bin do estágio 0"
+        run(br, "git", "reset", "-q", "--hard", "HEAD")
+        escreve("seg.bin", limpo_b)
+        escreve("0:seg.bin", sujo_b)
+        run(br, "git", "add", "seg.bin", "0:seg.bin")
+        r = d("git commit -m x", br)
+        ok(r and r[0] == "deny" and "0:seg.bin" in r[1], "binário sujo com dois-pontos no nome: nega: %r" % (r,))
+        run(br, "git", "rm", "-q", "-f", "--cached", "seg.bin", "0:seg.bin")
+        os.remove(os.path.join(br, "seg.bin"))
+        os.remove(os.path.join(br, "0:seg.bin"))
+        # configuração de diff do repositório (conversor de texto, diff externo) não esconde o conteúdo
+        escreve(".gitattributes", b"*.cfg diff=oculto\n*.dat diff=oculto\n")
+        run(br, "git", "config", "diff.oculto.textconv", "true")          # "converte" qualquer arquivo em nada
+        escreve("app.cfg", ("chave = " + chave2 + "\n").encode())
+        run(br, "git", "add", "app.cfg")
+        ok(tipo("git commit -m x", br) == "deny", "conversor de texto não esconde segredo em arquivo de texto")
+        run(br, "git", "rm", "-q", "-f", "--cached", "app.cfg")
+        ok(tipo("git add app.cfg && git commit -m x", br) == "deny", "nem fora do índice (add na mesma chamada)")
+        os.remove(os.path.join(br, "app.cfg"))
+        escreve("dados.dat", sujo_b)
+        run(br, "git", "add", "dados.dat")
+        ok(tipo("git commit -m x", br) == "deny", "conversor de texto não esconde segredo em binário")
+        run(br, "git", "rm", "-q", "-f", "--cached", "dados.dat")
+        os.remove(os.path.join(br, "dados.dat"))
+        run(br, "git", "config", "--unset", "diff.oculto.textconv")
+        os.remove(os.path.join(br, ".gitattributes"))
+        run(br, "git", "config", "diff.external", "true")                  # diff externo que não imprime nada
+        escreve("app.js", ("const k = '" + chave2 + "';\n").encode())
+        run(br, "git", "add", "app.js")
+        ok(tipo("git commit -m x", br) == "deny", "diff externo não esconde segredo")
+        run(br, "git", "rm", "-q", "-f", "--cached", "app.js")
+        os.remove(os.path.join(br, "app.js"))
+        run(br, "git", "config", "--unset", "diff.external")
+        ok(d("git commit -m x", br) is None, "binrepo: de volta ao limpo, passa")
         # arquivo novo que não abre: não foi examinado, então não vai
         escreve("trancado.js", b"console.log(1)\n")
         os.chmod(os.path.join(br, "trancado.js"), 0)
