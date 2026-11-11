@@ -217,9 +217,10 @@ def palavras_do_push(pasta, sub, p):
     resto = p[1:]
     if sub == "push":
         return resto
-    do_apelido = [w for a in resto if (a.startswith("alias.") or a.startswith("-calias.")) and "=" in a
-                  for w in _palavras(a.split("=", 1)[1])]
-    if do_apelido or any(a.startswith(("alias.", "-calias.", "--config-env")) for a in resto):
+    # Nome de configuração do git não distingue maiúscula de minúscula: `Alias.P` é `alias.p`.
+    e_apelido = lambda a: a.lower().startswith(("alias.", "-calias."))
+    do_apelido = [w for a in resto if e_apelido(a) and "=" in a for w in _palavras(a.split("=", 1)[1])]
+    if do_apelido or any(e_apelido(a) or a.lower().startswith("--config-env") for a in resto):
         # Apelido definido na própria linha. O valor dele (`alias.p=push --force`) entra no exame de
         # força. O de `--config-env` mora numa variável e não é lido: fica na pergunta.
         return resto + [w.lstrip("!") for w in do_apelido]
@@ -323,36 +324,61 @@ def segredos_no_texto(texto, so_fortes=False, fim=None):
     return sorted(achados)
 
 
-def examinar_arquivo(caminho, nome, fim):
-    """(rótulos, examinou até o fim?) do arquivo inteiro, de qualquer tamanho, lido em blocos com
-    sobra (arquivo de uma linha só não escapa do prazo). Texto passa por todas as réguas. Binário
+def examinar_fluxo(f, nome, fim):
+    """(rótulos, examinou até o fim?) de um fluxo de bytes, lido em blocos com sobra e sem voltar
+    atrás (serve para arquivo e para a saída do git). Texto passa por todas as réguas. Binário
     (byte nulo no começo, a régua do git) passa pelas de formato inconfundível de chave, onde
-    houver começo de chave. Texto em UTF-16 é lido como texto. Levanta OSError."""
+    houver começo de chave. Texto em UTF-16 é lido como texto."""
     so_fortes, achados = bool(NOME_PERMITIDO.search(nome)), set()
     try:
-        with open(caminho, "rb") as f:
-            cabeca = f.read(8000)
-            f.seek(0)
-            if cabeca[:2] in (b"\xff\xfe", b"\xfe\xff"):
-                if os.fstat(f.fileno()).st_size > UTF16_TETO:
-                    return [], False
-                return segredos_no_texto(f.read().decode("utf-16", "replace"), so_fortes, fim), True
-            binario, resto = b"\0" in cabeca, b""
-            while True:
-                if time.monotonic() > fim:
-                    return sorted(achados), False
-                bloco = f.read(BLOCO)
-                if not bloco:
-                    return sorted(achados), True
-                dados = resto + bloco
-                resto = dados[-SOBRA:]
-                if binario:
-                    if any(a in dados for a in ANCORAS):
-                        achados.update(segredos_no_texto(dados.decode("latin-1"), True, fim))
-                else:
-                    achados.update(segredos_no_texto(dados.decode("utf-8", "replace"), so_fortes, fim))
+        bloco = f.read(8000)
+        if bloco[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            resto = f.read(UTF16_TETO + 1)
+            if len(resto) > UTF16_TETO:
+                return [], False
+            return segredos_no_texto((bloco + resto).decode("utf-16", "replace"), so_fortes, fim), True
+        binario, sobra = b"\0" in bloco, b""
+        while bloco:
+            if time.monotonic() > fim:
+                return sorted(achados), False
+            dados = sobra + bloco
+            sobra = dados[-SOBRA:]
+            if binario:
+                if any(a in dados for a in ANCORAS):
+                    achados.update(segredos_no_texto(dados.decode("latin-1"), True, fim))
+            else:
+                achados.update(segredos_no_texto(dados.decode("utf-8", "replace"), so_fortes, fim))
+            bloco = f.read(BLOCO)
+        return sorted(achados), True
     except SemTempo:
         return sorted(achados), False
+
+
+def examinar_arquivo(caminho, nome, fim):
+    """O arquivo como está no DISCO. Levanta OSError."""
+    with open(caminho, "rb") as f:
+        return examinar_fluxo(f, nome, fim)
+
+
+def ler_do_indice(pasta, caminho, fim):
+    """O arquivo como está no ÍNDICE do git: é isso que o commit leva, mesmo que o disco já tenha
+    mudado ou o arquivo tenha sido apagado depois do `git add`. Se o git não entrega o conteúdo
+    inteiro, o exame não terminou (nunca "nada a relatar")."""
+    try:
+        proc = subprocess.Popen(["git", "-C", pasta, "cat-file", "blob", ":" + caminho],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return [], False
+    try:
+        rotulos, completo = examinar_fluxo(proc.stdout, caminho, fim)
+    except OSError:
+        rotulos, completo = [], False
+    finally:
+        if proc.poll() is None:
+            proc.kill()                                 # paramos antes do fim (prazo): não deixa o git pendurado
+        proc.stdout.close()
+        saiu = proc.wait()
+    return rotulos, completo and saiu == 0
 
 
 def _arquivos_de(caminho):
@@ -392,25 +418,29 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None, fim=None):
     Nunca devolve o segredo. Sempre olha o índice. `rastreados`: também o que mudou e ainda não
     está no índice (`commit -a`, ou `git add` na mesma chamada). `soltos`: caminhos do `git add`
     da mesma chamada ([] = tudo), para ler também os arquivos novos que ele levaria.
+    De onde se lê: o que já está no índice, do ÍNDICE (é o que vai, ainda que o disco mude depois);
+    o que ainda vai entrar nele, do disco. Texto, pelas linhas acrescentadas; binário, por inteiro
+    (o diff de texto só diz "Binary files differ").
     Exame que não se completou NÃO é exame limpo: volta na segunda lista, e o commit é negado."""
     fim = fim if fim is not None else time.monotonic() + PRAZO      # um prazo só para a chamada inteira
     resta = lambda: fim - time.monotonic()
     achados, falhas = [], []
     if _git(pasta, "rev-parse", "--is-inside-work-tree") is None:
         return [], []                                   # não é repositório: o commit nem acontece
+    topo = _topo(pasta)
 
     def nome(arq):
         if NOME_SEGREDO.search(arq) and not NOME_PERMITIDO.search(arq):
             achados.append((arq, "arquivo de segredo pelo nome"))
 
-    def diff(*args):
-        texto = _git(pasta, "diff", *args, "-U0", "--no-color", prazo=resta())
-        if texto is None:
+    def texto(opcoes, filtro):
+        saida = _git(pasta, "diff", *opcoes, "-U0", "--no-color", *filtro, prazo=resta())
+        if saida is None:
             falhas.append("o git não respondeu a tempo ao listar as mudanças")
             return
         arq = "?"
         try:
-            for linha in texto.splitlines():
+            for linha in saida.splitlines():
                 if linha.startswith("+++ "):
                     arq = linha[6:] if linha.startswith("+++ b/") else linha[4:]
                 elif linha.startswith("+"):
@@ -421,28 +451,43 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None, fim=None):
         except SemTempo:
             falhas.append("não deu tempo de ler todas as mudanças (parei em %s)" % arq)
 
-    nomes = _git(pasta, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", prazo=resta())
-    if nomes is None:
-        falhas.append("o git não respondeu ao listar o que está para comitar")
-    topo = _topo(pasta)
-    for arq in filter(None, (nomes or "").split("\0")):
-        nome(arq)
-    diff("--cached")
-    # Binário não aparece no diff de texto ("Binary files differ"): os que estão para ir são lidos do disco.
-    binarios = _git(pasta, "diff", "--cached", "--numstat", "-z", "--diff-filter=ACMR", prazo=resta())
-    for campo in (binarios or "").split("\0"):
-        partes = campo.split("\t")
-        if len(partes) == 3 and partes[0] == "-" and partes[2]:
-            try:
-                rotulos, completo = examinar_arquivo(os.path.join(topo, partes[2]), partes[2], fim)
-            except OSError:
-                rotulos, completo = [], True               # saiu do disco depois do add: não há o que ler
+    def binarios(opcoes, filtro, leitor):
+        # --no-renames: uma linha por arquivo, sempre `acrescentadas<TAB>tiradas<TAB>caminho`; `-` = binário.
+        saida = _git(pasta, "diff", *opcoes, "--numstat", "-z", "--no-renames", "--diff-filter=ACMR", *filtro,
+                     prazo=resta())
+        if saida is None:
+            falhas.append("o git não respondeu ao listar os arquivos binários")
+            return
+        for campo in saida.split("\0"):
+            partes = campo.split("\t", 2)
+            if len(partes) != 3 or partes[0] != "-" or not partes[2]:
+                continue
+            rotulos, completo = leitor(partes[2])
             achados.extend((partes[2], r) for r in rotulos)
             if not completo:
-                falhas.append("não deu tempo de ler tudo (parei em %s)" % partes[2])
+                falhas.append("não deu para ler até o fim: %s" % partes[2])
+
+    def do_disco(arq):
+        try:
+            return examinar_arquivo(os.path.join(topo, arq), arq, fim)
+        except OSError:
+            return [], False
+
+    # 1. o que já está no índice
+    nomes = _git(pasta, "diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=ACMR", prazo=resta())
+    if nomes is None:
+        falhas.append("o git não respondeu ao listar o que está para comitar")
+    for arq in filter(None, (nomes or "").split("\0")):
+        nome(arq)
+    texto(["--cached"], [])
+    binarios(["--cached"], [], lambda arq: ler_do_indice(pasta, arq, fim))
+    # 2. o que ainda vai entrar: rastreado e mudado (commit -a, ou add na mesma chamada)
     filtro = ["--", *soltos] if soltos else []
     if rastreados or soltos is not None:
-        diff(*([] if rastreados else filtro))
+        de_onde = [] if rastreados else filtro
+        texto([], de_onde)
+        binarios([], de_onde, do_disco)
+    # 3. arquivo novo que o add da mesma chamada leva
     if soltos is not None:
         lista = _git(pasta, "ls-files", "--others", "--exclude-standard", "--full-name", "-z", *filtro, prazo=resta())
         if lista is None:
@@ -452,13 +497,10 @@ def segredos_do_commit(pasta, rastreados=False, soltos=None, fim=None):
             falhas.append("%d arquivos novos de uma vez (examino até %d)" % (len(novos), TETO_ARQUIVOS))
         for arq in novos[:TETO_ARQUIVOS]:
             nome(arq)
-            try:
-                rotulos, completo = examinar_arquivo(os.path.join(topo, arq), arq, fim)
-            except OSError:
-                rotulos, completo = [], not os.path.lexists(os.path.join(topo, arq))
+            rotulos, completo = do_disco(arq)
             achados.extend((arq, r) for r in rotulos)
             if not completo:
-                falhas.append("não deu tempo de ler tudo (parei em %s)" % arq)
+                falhas.append("não deu para ler até o fim: %s" % arq)
                 break
     vistos, unicos = set(), []
     for a in achados:
@@ -772,6 +814,11 @@ def _selftest():
             ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
 
         # -- git clean
+        # nome de configuração do git não distingue maiúscula: `Alias.P` é `alias.p`
+        for cmd in ("git -c Alias.P='push --force' p", "git -c ALIAS.p='push -f' p", "git -cAlias.p='push --force' p"):
+            ok(tipo(cmd) == "deny", "devia negar: %r → %r" % (cmd, d(cmd)))
+        ok(tipo("git -c ALIAS.p=push p") == "ask", "apelido em maiúscula sem força: pergunta")
+        ok(tipo("git --config-env=Alias.p=VAR p") == "ask", "apelido por variável de ambiente: pergunta")
         # apelido definido na própria linha: a força escondida no valor dele também nega
         for cmd in ("git -c alias.p='push --force' p", "git -c 'alias.p=push -f origin main' p",
                     "git -calias.p='push --force-with-lease' p", "git -c alias.p='!git push --force' p",
@@ -1045,6 +1092,67 @@ def _selftest():
             TETO_ARQUIVOS = teto_de_verdade
             for i in range(5):
                 os.remove(os.path.join(site, "novo%d.js" % i))
+
+        # -- binário: vale o que está no git, não o que está no disco; e vale fora do índice também
+        br = os.path.join(tmp, "binrepo")
+        os.makedirs(br)
+        run(br, "git", "init", "-q", "-b", "main")
+        run(br, "git", "config", "user.email", "t@t")
+        run(br, "git", "config", "user.name", "t")
+        limpo_b = b"\x00\x01\x02" * 20000
+        sujo_b = limpo_b + chave2.encode() + b"\x00" * 20
+        escreve = lambda nome_b, dados: open(os.path.join(br, nome_b), "wb").write(dados)
+        escreve("a.bin", limpo_b)
+        escreve("m.bin", limpo_b + b"\x07")
+        run(br, "git", "add", "a.bin", "m.bin")
+        run(br, "git", "commit", "-qm", "base")
+        ok(d("git commit -m x", br) is None, "binrepo: base limpa passa")
+        # (1) chave vai para o índice; depois o disco é trocado por cópia limpa, ou apagado
+        escreve("a.bin", sujo_b)
+        run(br, "git", "add", "a.bin")
+        escreve("a.bin", limpo_b)
+        r = d("git commit -m x", br)
+        ok(r and r[0] == "deny" and "a.bin" in r[1], "binário sujo no índice e limpo no disco: nega: %r" % (r,))
+        os.remove(os.path.join(br, "a.bin"))
+        ok(tipo("git commit -m x", br) == "deny", "binário sujo no índice e apagado do disco: nega")
+        run(br, "git", "reset", "-q", "--hard", "HEAD")
+        # (2) binário rastreado, mudado e ainda FORA do índice: commit -a e add na mesma chamada levam
+        escreve("a.bin", sujo_b)
+        ok(tipo("git commit -am x", br) == "deny", "binário mudado fora do índice + commit -a: nega")
+        ok(tipo("git add a.bin && git commit -m x", br) == "deny", "binário mudado + add na mesma chamada: nega")
+        ok(d("git commit -m x", br) is None, "binário mudado que o commit simples não leva: passa")
+        ok(d("git add m.bin && git commit -m x", br) is None, "add de OUTRO arquivo não esbarra no binário sujo")
+        run(br, "git", "reset", "-q", "--hard", "HEAD")
+        # (3) renomeado no índice (o git escreve isso num formato próprio)
+        run(br, "git", "mv", "m.bin", "renomeado.bin")
+        escreve("renomeado.bin", limpo_b + b"\x07" + chave2.encode() + b"\x00" * 20)
+        run(br, "git", "add", "renomeado.bin")
+        r = d("git commit -m x", br)
+        ok(r and r[0] == "deny" and "renomeado.bin" in r[1], "binário renomeado e sujo no índice: nega: %r" % (r,))
+        run(br, "git", "reset", "-q", "--hard", "HEAD")
+        # arquivo novo que não abre: não foi examinado, então não vai
+        escreve("trancado.js", b"console.log(1)\n")
+        os.chmod(os.path.join(br, "trancado.js"), 0)
+        try:
+            r = d("git add trancado.js && git commit -m x", br)
+            ok(r and r[0] == "deny" and "examinar" in r[1], "arquivo novo que não abre: nega: %r" % (r,))
+        finally:
+            os.chmod(os.path.join(br, "trancado.js"), 0o644)
+        ok(d("git add trancado.js && git commit -m x", br) is None, "controle: o mesmo arquivo, legível, passa")
+        os.remove(os.path.join(br, "trancado.js"))
+        # o que o git não consegue entregar não é tratado como limpo
+        escreve("a.bin", sujo_b)
+        run(br, "git", "add", "a.bin")
+        global ler_do_indice
+        ok(ler_do_indice(br, "nao-esta-no-indice.bin", time.monotonic() + 5) == ([], False),
+           "conteúdo que o git não entrega: exame não terminou (nunca 'limpo')")
+        ler_real = ler_do_indice
+        ler_do_indice = lambda *a, **k: ([], False)
+        try:
+            r = d("git commit -m x", br)
+            ok(r and r[0] == "deny" and "examinar" in r[1], "binário do índice que não deu para ler: nega: %r" % (r,))
+        finally:
+            ler_do_indice = ler_real
 
         # -- o hook de verdade, pelo stdin
         def hook(payload, *args, entrada=None):
